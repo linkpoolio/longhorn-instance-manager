@@ -96,7 +96,12 @@ func (ops V2DataEngineProxyOps) ReplicaAdd(ctx context.Context, req *rpc.EngineR
 
 	replicaAddress := strings.TrimPrefix(req.ReplicaAddress, "tcp://")
 
-	err = c.EngineFrontendReplicaAdd(req.ProxyEngineRequest.EngineFrontendName, req.ReplicaName, replicaAddress, req.FastSync)
+	engineFrontendName := req.ProxyEngineRequest.EngineFrontendName
+	if engineFrontendName == "" {
+		engineFrontendName = req.ProxyEngineRequest.EngineName
+	}
+
+	err = c.EngineFrontendReplicaAdd(engineFrontendName, req.ReplicaName, replicaAddress, req.FastSync)
 	if err != nil {
 		return nil, grpcstatus.Errorf(grpccodes.Internal, "failed to add replica %v: %v", replicaAddress, err)
 	}
