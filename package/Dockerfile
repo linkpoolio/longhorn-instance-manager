@@ -43,7 +43,7 @@ ARG SRC_TAG
 RUN zypper -n ref && \
     zypper update -y
 
-RUN zypper -n install cmake gcc gcc13 xsltproc docbook-xsl-stylesheets git python311 python311-pip fuse3-devel jq nasm
+RUN zypper -n install cmake gcc gcc13 xsltproc docbook-xsl-stylesheets git python311 python311-pip fuse3-devel jq nasm rdma-core-devel
 
 RUN ln -sf /usr/bin/python3.11 /usr/local/bin/python && \
     ln -sf /usr/bin/python3.11 /usr/local/bin/python3 && \
@@ -92,7 +92,7 @@ ARG ARCH=amd64
 RUN zypper -n ref && \
     zypper update -y
 
-RUN zypper -n install kmod jq util-linux procps awk qemu-tools e2fsprogs xfsprogs python311-base device-mapper netcat fuse3-devel logrotate libcmocka-devel
+RUN zypper -n install kmod jq util-linux procps awk qemu-tools e2fsprogs xfsprogs python311-base device-mapper netcat fuse3-devel logrotate libcmocka-devel rdma-core libibverbs librdmacm1
 
 RUN ln -sf /usr/bin/python3.11 /usr/local/bin/python && \
     ln -sf /usr/bin/python3.11 /usr/local/bin/python3
