@@ -96,7 +96,7 @@ func newStartRequest(engineName, volumeName, frontend, address string) *rpc.Engi
 			EngineName: engineName,
 			VolumeName: volumeName,
 			Address:    address,
-			DataEngine: "v2",
+			DataEngine: rpc.DataEngine_DATA_ENGINE_V2,
 		},
 		FrontendStart: &enginerpc.VolumeFrontendStartRequest{
 			Frontend: frontend,
