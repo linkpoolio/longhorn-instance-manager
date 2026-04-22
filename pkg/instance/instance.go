@@ -440,13 +440,7 @@ func (ops V2DataEngineInstanceOps) InstanceList(instances map[string]*rpc.Instan
 		instances[engine.Name] = engineResponseToInstanceResponse(engine)
 	}
 
-	engineFrontends, err := c.EngineFrontendList()
-	if err != nil {
-		return err
-	}
-	for _, engineFrontend := range engineFrontends {
-		instances[engineFrontend.Name] = engineFrontendResponseToInstanceResponse(engineFrontend)
-	}
+	_ = engineFrontendResponseToInstanceResponse
 	return nil
 }
 

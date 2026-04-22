@@ -92,7 +92,12 @@ func (ops V2DataEngineProxyOps) VolumeSnapshot(ctx context.Context, req *rpc.Eng
 		snapshotName = util.UUID()
 	}
 
-	_, err = c.EngineFrontendSnapshotCreate(req.ProxyEngineRequest.EngineFrontendName, snapshotName)
+	engineFrontendName := req.ProxyEngineRequest.EngineFrontendName
+	if engineFrontendName == "" {
+		engineFrontendName = req.ProxyEngineRequest.EngineName
+	}
+
+	_, err = c.EngineFrontendSnapshotCreate(engineFrontendName, snapshotName)
 	if err != nil {
 		return nil, grpcstatus.Errorf(grpccodes.Internal, "failed to create snapshot %v: %v", snapshotName, err)
 	}
@@ -522,7 +527,12 @@ func (ops V2DataEngineProxyOps) SnapshotRevert(ctx context.Context, req *rpc.Eng
 		}
 	}()
 
-	err = c.EngineFrontendSnapshotRevert(req.ProxyEngineRequest.EngineFrontendName, req.Name)
+	engineFrontendName := req.ProxyEngineRequest.EngineFrontendName
+	if engineFrontendName == "" {
+		engineFrontendName = req.ProxyEngineRequest.EngineName
+	}
+
+	err = c.EngineFrontendSnapshotRevert(engineFrontendName, req.Name)
 	if err != nil {
 		return nil, grpcstatus.Errorf(grpccodes.Internal, "failed to create snapshot %v: %v", req.Name, err)
 	}
@@ -577,8 +587,13 @@ func (ops V2DataEngineProxyOps) SnapshotPurge(ctx context.Context, req *rpc.Engi
 		}
 	}()
 
+	engineFrontendName := req.ProxyEngineRequest.EngineFrontendName
+	if engineFrontendName == "" {
+		engineFrontendName = req.ProxyEngineRequest.EngineName
+	}
+
 	// For v2 Data Engine, snapshot purge is no longer a time-consuming operation
-	err = c.EngineFrontendSnapshotPurge(req.ProxyEngineRequest.EngineFrontendName)
+	err = c.EngineFrontendSnapshotPurge(engineFrontendName)
 	return &emptypb.Empty{}, nil
 }
 
@@ -684,9 +699,14 @@ func (ops V2DataEngineProxyOps) SnapshotRemove(ctx context.Context, req *rpc.Eng
 		}
 	}()
 
+	engineFrontendName := req.ProxyEngineRequest.EngineFrontendName
+	if engineFrontendName == "" {
+		engineFrontendName = req.ProxyEngineRequest.EngineName
+	}
+
 	var lastErr error
 	for _, name := range req.Names {
-		err = c.EngineFrontendSnapshotDelete(req.ProxyEngineRequest.EngineFrontendName, name)
+		err = c.EngineFrontendSnapshotDelete(engineFrontendName, name)
 		if err != nil {
 			lastErr = err
 			logrus.WithError(err).Warnf("Failed to delete snapshot %s", name)

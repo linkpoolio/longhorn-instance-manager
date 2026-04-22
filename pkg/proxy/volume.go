@@ -92,42 +92,27 @@ func (ops V2DataEngineProxyOps) VolumeGet(ctx context.Context, req *rpc.ProxyEng
 		}
 	}()
 
+	view, err := resolveV2VolumeView(c, req.EngineName, req.EngineFrontendName)
+	if err != nil {
+		return nil, grpcstatus.Errorf(grpccodes.Internal, "failed to get engine %v: %v", req.EngineName, err)
+	}
+
 	engine, err := c.EngineGet(req.EngineName)
 	if err != nil {
 		return nil, grpcstatus.Errorf(grpccodes.Internal, "failed to get engine %v: %v", req.EngineName, err)
 	}
 
-	size := int64(engine.SpecSize)
-	endpoint := engine.Endpoint
-	frontend := engine.Frontend
-	isExpanding := engine.IsExpanding
-	lastExpansionError := engine.LastExpansionError
-	lastExpansionFailedAt := engine.LastExpansionFailedAt
-	if req.EngineFrontendName != "" {
-		engineFrontend, err := c.EngineFrontendGet(req.EngineFrontendName)
-		if err == nil && engineFrontend != nil {
-			size = int64(engineFrontend.SpecSize)
-			endpoint = engineFrontend.Endpoint
-			frontend = engineFrontend.Frontend
-			isExpanding = engine.IsExpanding || engineFrontend.IsExpanding
-			if engineFrontend.LastExpansionError != "" {
-				lastExpansionError = engineFrontend.LastExpansionError
-				lastExpansionFailedAt = engineFrontend.LastExpansionFailedAt
-			}
-		}
-	}
-
 	return &rpc.EngineVolumeGetProxyResponse{
 		Volume: &enginerpc.Volume{
 			Name:                      engine.Name,
-			Size:                      size,
+			Size:                      view.Size,
 			ReplicaCount:              int32(len(engine.ReplicaAddressMap)),
-			Endpoint:                  endpoint,
-			Frontend:                  frontend,
+			Endpoint:                  view.Endpoint,
+			Frontend:                  view.Frontend,
 			FrontendState:             "",
-			IsExpanding:               isExpanding,
-			LastExpansionError:        lastExpansionError,
-			LastExpansionFailedAt:     lastExpansionFailedAt,
+			IsExpanding:               view.IsExpanding,
+			LastExpansionError:        view.LastExpansionError,
+			LastExpansionFailedAt:     view.LastExpansionFailedAt,
 			UnmapMarkSnapChainRemoved: false,
 		},
 	}, nil
@@ -240,7 +225,25 @@ func (ops V1DataEngineProxyOps) VolumeFrontendStart(ctx context.Context, req *rp
 }
 
 func (ops V2DataEngineProxyOps) VolumeFrontendStart(ctx context.Context, req *rpc.EngineVolumeFrontendStartRequest) (resp *emptypb.Empty, err error) {
-	return nil, grpcstatus.Errorf(grpccodes.Unimplemented, "VolumeFrontendStart is not yet implemented for V2 engine")
+	c, err := getSPDKClientFromAddress(req.ProxyEngineRequest.Address)
+	if err != nil {
+		return nil, grpcstatus.Errorf(grpccodes.Internal, "failed to get SPDK client from engine address %v: %v", req.ProxyEngineRequest.Address, err)
+	}
+	defer func() {
+		if closeErr := c.Close(); closeErr != nil {
+			logrus.WithFields(logrus.Fields{
+				"serviceURL": req.ProxyEngineRequest.Address,
+				"engineName": req.ProxyEngineRequest.EngineName,
+				"volumeName": req.ProxyEngineRequest.VolumeName,
+				"dataEngine": req.ProxyEngineRequest.DataEngine,
+			}).WithError(closeErr).Warn("Failed to close SPDK client after VolumeFrontendStart")
+		}
+	}()
+
+	if err := startV2EngineFrontend(c, req); err != nil {
+		return nil, err
+	}
+	return &emptypb.Empty{}, nil
 }
 
 func (p *Proxy) VolumeFrontendShutdown(ctx context.Context, req *rpc.ProxyEngineRequest) (resp *emptypb.Empty, err error) {
@@ -284,7 +287,25 @@ func (ops V1DataEngineProxyOps) VolumeFrontendShutdown(ctx context.Context, req 
 }
 
 func (ops V2DataEngineProxyOps) VolumeFrontendShutdown(ctx context.Context, req *rpc.ProxyEngineRequest) (resp *emptypb.Empty, err error) {
-	return nil, grpcstatus.Errorf(grpccodes.Unimplemented, "VolumeFrontendShutdown is not yet implemented for V2 engine")
+	c, err := getSPDKClientFromAddress(req.Address)
+	if err != nil {
+		return nil, grpcstatus.Errorf(grpccodes.Internal, "failed to get SPDK client from engine address %v: %v", req.Address, err)
+	}
+	defer func() {
+		if closeErr := c.Close(); closeErr != nil {
+			logrus.WithFields(logrus.Fields{
+				"serviceURL": req.Address,
+				"engineName": req.EngineName,
+				"volumeName": req.VolumeName,
+				"dataEngine": req.DataEngine,
+			}).WithError(closeErr).Warn("Failed to close SPDK client after VolumeFrontendShutdown")
+		}
+	}()
+
+	if err := shutdownV2EngineFrontend(c, req); err != nil {
+		return nil, err
+	}
+	return &emptypb.Empty{}, nil
 }
 
 func (p *Proxy) VolumeUnmapMarkSnapChainRemovedSet(ctx context.Context, req *rpc.EngineVolumeUnmapMarkSnapChainRemovedSetRequest) (resp *emptypb.Empty, err error) {
