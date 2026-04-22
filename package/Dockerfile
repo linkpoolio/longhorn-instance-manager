@@ -152,6 +152,15 @@ COPY package/exec-logrotate /usr/local/bin/
 # Verify the dependencies for the binaries
 RUN ldd /usr/local/bin/* /usr/local/sbin/* /usr/sbin/* | grep "not found" && exit 1 || true
 
+# Verify spdk_tgt was built with RDMA transport support. zypper update during
+# the build is unpinned, so a rebuild can silently pick up a package set that
+# fails to provide librdmacm/libibverbs at configure time; SPDK then compiles
+# without the RDMA transport module, the image looks fine, but at runtime
+# nvmf_create_transport(rdma) returns "Invalid transport type" and every
+# RDMA-labelled node falls back to TCP. Catch that here.
+RUN ldd /usr/local/bin/spdk_tgt | grep -q librdmacm || (echo "FATAL: spdk_tgt not linked against librdmacm (RDMA transport missing)" && exit 1)
+RUN ldd /usr/local/bin/spdk_tgt | grep -q libibverbs || (echo "FATAL: spdk_tgt not linked against libibverbs (RDMA transport missing)" && exit 1)
+
 # Add Tini
 ENV TINI_VERSION v0.19.0
 ADD https://github.com/krallin/tini/releases/download/${TINI_VERSION}/tini-${ARCH} /tini
