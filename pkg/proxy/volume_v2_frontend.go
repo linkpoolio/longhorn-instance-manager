@@ -1,6 +1,9 @@
 package proxy
 
 import (
+	"net"
+	"strconv"
+
 	grpccodes "google.golang.org/grpc/codes"
 	grpcstatus "google.golang.org/grpc/status"
 
@@ -30,6 +33,20 @@ func startV2EngineFrontend(client v2FrontendSPDKClient, req *rpc.EngineVolumeFro
 		return grpcstatus.Errorf(grpccodes.Internal, "failed to get engine %v for frontend start: %v", req.ProxyEngineRequest.EngineName, err)
 	}
 
+	// If a frontend already exists from a previous engine instance, its target
+	// address can point at a port the new engine doesn't own anymore (ports
+	// are reallocated on engine recreate). The kernel initiator then retries
+	// forever with "connection refused". Compare and delete-recreate on
+	// mismatch rather than returning AlreadyExists as idempotent success.
+	if existing, getErr := client.EngineFrontendGet(req.ProxyEngineRequest.EngineName); getErr == nil && existing != nil {
+		if engineFrontendTargetMatches(existing, req.ProxyEngineRequest.Address) {
+			return nil
+		}
+		if err := client.EngineFrontendDelete(req.ProxyEngineRequest.EngineName); err != nil && grpcstatus.Code(err) != grpccodes.NotFound {
+			return grpcstatus.Errorf(grpccodes.Internal, "failed to delete stale engine frontend %v before recreate: %v", req.ProxyEngineRequest.EngineName, err)
+		}
+	}
+
 	_, err = client.EngineFrontendCreate(
 		req.ProxyEngineRequest.EngineName,
 		req.ProxyEngineRequest.VolumeName,
@@ -43,6 +60,17 @@ func startV2EngineFrontend(client v2FrontendSPDKClient, req *rpc.EngineVolumeFro
 		return err
 	}
 	return nil
+}
+
+// engineFrontendTargetMatches returns true if the frontend's recorded target
+// address equals the address we'd pass to EngineFrontendCreate. The address
+// fed into VolumeFrontendStart is an ip:port string; EngineFrontend stores
+// TargetIP/TargetPort separately.
+func engineFrontendTargetMatches(ef *api.EngineFrontend, address string) bool {
+	if ef == nil {
+		return false
+	}
+	return net.JoinHostPort(ef.TargetIP, strconv.Itoa(int(ef.TargetPort))) == address
 }
 
 // shutdownV2EngineFrontend mirrors startV2EngineFrontend: delete the

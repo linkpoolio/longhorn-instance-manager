@@ -134,16 +134,67 @@ func TestStartV2EngineFrontend_HappyPath(t *testing.T) {
 }
 
 func TestStartV2EngineFrontend_AlreadyExistsIsIdempotent(t *testing.T) {
+	// Existing frontend with matching target → startV2EngineFrontend must be
+	// a no-op (no delete, no create). Treating AlreadyExists as plain success.
 	f := &fakeV2FrontendClient{
-		engines: map[string]*api.Engine{
-			"eng-0": {SpecSize: 1024},
+		engines: map[string]*api.Engine{"eng-0": {SpecSize: 1024}},
+		frontends: map[string]*api.EngineFrontend{
+			"eng-0": {Name: "eng-0", TargetIP: "10.10.4.11", TargetPort: 20001},
 		},
+	}
+	req := newStartRequest("eng-0", "vol", "spdk-tcp-blockdev", "10.10.4.11:20001")
+
+	if err := startV2EngineFrontend(f, req); err != nil {
+		t.Fatalf("matching existing frontend must be treated as success, got: %v", err)
+	}
+	if len(f.createCalls) != 0 {
+		t.Fatalf("EngineFrontendCreate must not be called when existing frontend matches")
+	}
+	if len(f.deleteCalls) != 0 {
+		t.Fatalf("EngineFrontendDelete must not be called when existing frontend matches")
+	}
+}
+
+func TestStartV2EngineFrontend_StaleTargetIsReplaced(t *testing.T) {
+	// Existing frontend was created against an older engine instance with
+	// a different port. Ports are reallocated on engine recreate; the stale
+	// frontend's initiator would retry `nvme connect` against a port the new
+	// engine doesn't own. startV2EngineFrontend must delete the stale
+	// frontend and recreate against the current target.
+	f := &fakeV2FrontendClient{
+		engines: map[string]*api.Engine{"eng-0": {SpecSize: 1024}},
+		frontends: map[string]*api.EngineFrontend{
+			"eng-0": {Name: "eng-0", TargetIP: "10.10.4.11", TargetPort: 20002},
+		},
+	}
+	req := newStartRequest("eng-0", "vol", "spdk-tcp-blockdev", "10.10.4.11:20003")
+
+	if err := startV2EngineFrontend(f, req); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(f.deleteCalls) != 1 || f.deleteCalls[0] != "eng-0" {
+		t.Fatalf("expected one Delete of 'eng-0', got %v", f.deleteCalls)
+	}
+	if len(f.createCalls) != 1 {
+		t.Fatalf("expected one Create after delete, got %d", len(f.createCalls))
+	}
+	if f.createCalls[0].TargetAddress != "10.10.4.11:20003" {
+		t.Fatalf("recreated frontend must use new target, got %q", f.createCalls[0].TargetAddress)
+	}
+}
+
+func TestStartV2EngineFrontend_CreateAlreadyExistsIsIdempotent(t *testing.T) {
+	// No existing frontend at Get time but a concurrent creator raced us to
+	// EngineFrontendCreate — the server returns AlreadyExists. Treat as
+	// success so longhorn-manager's retry loop doesn't keep faulting.
+	f := &fakeV2FrontendClient{
+		engines:           map[string]*api.Engine{"eng-0": {SpecSize: 1024}},
 		frontendCreateErr: grpcstatus.Errorf(grpccodes.AlreadyExists, "frontend eng-0 already exists"),
 	}
 	req := newStartRequest("eng-0", "vol", "spdk-tcp-blockdev", "10.10.4.11:20001")
 
 	if err := startV2EngineFrontend(f, req); err != nil {
-		t.Fatalf("AlreadyExists must be treated as success, got: %v", err)
+		t.Fatalf("AlreadyExists on Create must still succeed, got: %v", err)
 	}
 }
 
