@@ -92,49 +92,27 @@ func (ops V2DataEngineProxyOps) VolumeGet(ctx context.Context, req *rpc.ProxyEng
 		}
 	}()
 
+	view, err := resolveV2VolumeView(c, req.EngineName, req.EngineFrontendName)
+	if err != nil {
+		return nil, grpcstatus.Errorf(grpccodes.Internal, "failed to get engine %v: %v", req.EngineName, err)
+	}
+
 	engine, err := c.EngineGet(req.EngineName)
 	if err != nil {
 		return nil, grpcstatus.Errorf(grpccodes.Internal, "failed to get engine %v: %v", req.EngineName, err)
 	}
 
-	size := int64(engine.SpecSize)
-	endpoint := engine.Endpoint
-	frontend := engine.Frontend
-	isExpanding := engine.IsExpanding
-	lastExpansionError := engine.LastExpansionError
-	lastExpansionFailedAt := engine.LastExpansionFailedAt
-	// EngineFrontendName falls back to EngineName: V2DataEngineProxyOps.VolumeFrontendStart
-	// creates the EngineFrontend with name=engineName, and upstream
-	// longhorn-manager doesn't yet pass an explicit EngineFrontendName to VolumeGet.
-	frontendLookupName := req.EngineFrontendName
-	if frontendLookupName == "" {
-		frontendLookupName = req.EngineName
-	}
-	if frontendLookupName != "" {
-		engineFrontend, err := c.EngineFrontendGet(frontendLookupName)
-		if err == nil && engineFrontend != nil {
-			size = int64(engineFrontend.SpecSize)
-			endpoint = engineFrontend.Endpoint
-			frontend = engineFrontend.Frontend
-			isExpanding = engine.IsExpanding || engineFrontend.IsExpanding
-			if engineFrontend.LastExpansionError != "" {
-				lastExpansionError = engineFrontend.LastExpansionError
-				lastExpansionFailedAt = engineFrontend.LastExpansionFailedAt
-			}
-		}
-	}
-
 	return &rpc.EngineVolumeGetProxyResponse{
 		Volume: &enginerpc.Volume{
 			Name:                      engine.Name,
-			Size:                      size,
+			Size:                      view.Size,
 			ReplicaCount:              int32(len(engine.ReplicaAddressMap)),
-			Endpoint:                  endpoint,
-			Frontend:                  frontend,
+			Endpoint:                  view.Endpoint,
+			Frontend:                  view.Frontend,
 			FrontendState:             "",
-			IsExpanding:               isExpanding,
-			LastExpansionError:        lastExpansionError,
-			LastExpansionFailedAt:     lastExpansionFailedAt,
+			IsExpanding:               view.IsExpanding,
+			LastExpansionError:        view.LastExpansionError,
+			LastExpansionFailedAt:     view.LastExpansionFailedAt,
 			UnmapMarkSnapChainRemoved: false,
 		},
 	}, nil
@@ -247,10 +225,6 @@ func (ops V1DataEngineProxyOps) VolumeFrontendStart(ctx context.Context, req *rp
 }
 
 func (ops V2DataEngineProxyOps) VolumeFrontendStart(ctx context.Context, req *rpc.EngineVolumeFrontendStartRequest) (resp *emptypb.Empty, err error) {
-	// Upstream stubbed this as Unimplemented when the engine/frontend split
-	// landed server-side but never wired longhorn-manager to call
-	// EngineFrontendCreate directly. Translate the legacy request into the
-	// new RPC so the block-device initiator actually comes up.
 	c, err := getSPDKClientFromAddress(req.ProxyEngineRequest.Address)
 	if err != nil {
 		return nil, grpcstatus.Errorf(grpccodes.Internal, "failed to get SPDK client from engine address %v: %v", req.ProxyEngineRequest.Address, err)
@@ -266,24 +240,7 @@ func (ops V2DataEngineProxyOps) VolumeFrontendStart(ctx context.Context, req *rp
 		}
 	}()
 
-	engine, err := c.EngineGet(req.ProxyEngineRequest.EngineName)
-	if err != nil {
-		return nil, grpcstatus.Errorf(grpccodes.Internal, "failed to get engine %v for frontend start: %v", req.ProxyEngineRequest.EngineName, err)
-	}
-
-	// The frontend name is reused from the engine name: one frontend per engine,
-	// and VolumeGet below falls back to EngineFrontendGet(engineName) when the
-	// manager doesn't pass an explicit EngineFrontendName.
-	_, err = c.EngineFrontendCreate(
-		req.ProxyEngineRequest.EngineName,
-		req.ProxyEngineRequest.VolumeName,
-		req.ProxyEngineRequest.EngineName,
-		req.FrontendStart.Frontend,
-		engine.SpecSize,
-		req.ProxyEngineRequest.Address,
-		0, 0,
-	)
-	if err != nil && grpcstatus.Code(err) != grpccodes.AlreadyExists {
+	if err := startV2EngineFrontend(c, req); err != nil {
 		return nil, err
 	}
 	return &emptypb.Empty{}, nil
@@ -330,7 +287,6 @@ func (ops V1DataEngineProxyOps) VolumeFrontendShutdown(ctx context.Context, req 
 }
 
 func (ops V2DataEngineProxyOps) VolumeFrontendShutdown(ctx context.Context, req *rpc.ProxyEngineRequest) (resp *emptypb.Empty, err error) {
-	// Mirror of VolumeFrontendStart: delete the EngineFrontend named after the engine.
 	c, err := getSPDKClientFromAddress(req.Address)
 	if err != nil {
 		return nil, grpcstatus.Errorf(grpccodes.Internal, "failed to get SPDK client from engine address %v: %v", req.Address, err)
@@ -346,11 +302,7 @@ func (ops V2DataEngineProxyOps) VolumeFrontendShutdown(ctx context.Context, req 
 		}
 	}()
 
-	frontendName := req.EngineFrontendName
-	if frontendName == "" {
-		frontendName = req.EngineName
-	}
-	if err := c.EngineFrontendDelete(frontendName); err != nil && grpcstatus.Code(err) != grpccodes.NotFound {
+	if err := shutdownV2EngineFrontend(c, req); err != nil {
 		return nil, err
 	}
 	return &emptypb.Empty{}, nil
