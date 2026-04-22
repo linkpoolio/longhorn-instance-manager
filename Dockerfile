@@ -31,7 +31,7 @@ RUN curl -fsSL https://raw.githubusercontent.com/golangci/golangci-lint/master/i
     && chmod +x /tmp/install.sh \
     && /tmp/install.sh -b /usr/local/bin ${GOLANGCI_LINT_VERSION}
 
-RUN git clone https://github.com/longhorn/dep-versions.git -b ${SRC_BRANCH} /usr/src/dep-versions && \
+RUN git clone https://github.com/linkpoolio/dep-versions.git -b ${SRC_BRANCH} /usr/src/dep-versions && \
     cd /usr/src/dep-versions && \
     if [ -n "${SRC_TAG}" ] && git show-ref --tags ${SRC_TAG} > /dev/null 2>&1; then \
         echo "Checking out tag ${SRC_TAG}"; \
