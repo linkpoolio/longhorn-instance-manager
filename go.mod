@@ -127,8 +127,8 @@ require (
 	sigs.k8s.io/yaml v1.6.0 // indirect
 )
 
-replace github.com/longhorn/go-spdk-helper => github.com/linkpoolio/go-spdk-helper v0.0.0-20260423121350-8c051e5e5237
+replace github.com/longhorn/go-spdk-helper => github.com/linkpoolio/go-spdk-helper v0.0.0-20260423162726-93d868dbfe8e
 
-replace github.com/longhorn/types => github.com/linkpoolio/types v0.0.0-20260421213429-050ebb0ef7b0
+replace github.com/longhorn/types => github.com/linkpoolio/types v0.0.0-20260423173434-e6daaeb4d4f4
 
-replace github.com/longhorn/longhorn-spdk-engine => github.com/linkpoolio/longhorn-spdk-engine v0.0.0-20260423143509-808f1cc9736c
+replace github.com/longhorn/longhorn-spdk-engine => github.com/linkpoolio/longhorn-spdk-engine v0.0.0-20260423175421-6665e7b3d052
