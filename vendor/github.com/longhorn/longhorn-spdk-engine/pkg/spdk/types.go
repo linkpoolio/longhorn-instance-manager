@@ -56,12 +56,57 @@ const (
 // overridden per-IM via env vars set by longhorn-manager's instance_manager_controller
 // from the data-engine Setting CRs. Kept as vars so all existing bare-identifier
 // call sites continue to compile.
+//
+// replicaCtrlrLossTimeoutSec lowered from upstream 15s to 3s: when a remote
+// replica IM disappears mid-rebuild, every RDMA_CM_EVENT_REJECTED from the
+// dying peer triggers bdev_nvme_failover_ctrlr reactively (no cooldown),
+// starving the local reactor until ctrlr_loss fires and the ctrlr is reaped.
+// At 15s we saw spdk_tgt crash with broken-pipe on /var/tmp/spdk.sock. 3s
+// trims the spam window below the liveness threshold.
+//
+// rebuildCtrlrLossTimeoutSec / rebuildFastIOFailTimeoutSec apply only to the
+// three rebuild-path bdev_nvme attachments in replica.go (clone src->dst,
+// rebuild src->dst-rebuilding-lvol, rebuild dst->src-snapshot). Rebuild is
+// inherently restartable, so sub-second failover is safe here and makes
+// teardown-during-rebuild crash-proof.
 var (
-	replicaCtrlrLossTimeoutSec  = 15
+	replicaCtrlrLossTimeoutSec  = 3
 	replicaReconnectDelaySec    = 2
 	replicaFastIOFailTimeoutSec = 10
 	replicaTransportAckTimeout  = 10
 	replicaKeepAliveTimeoutMs   = 10000
+
+	rebuildCtrlrLossTimeoutSec  = 1
+	rebuildFastIOFailTimeoutSec = 1
+
+	// defaultLvolClearMethod controls the clear_method passed to
+	// bdev_lvol_create_lvstore and bdev_lvol_create. Empty string means
+	// "use SPDK default" (unmap). Longhorn installs running on kernels or
+	// bdevs where UNMAP issues synchronous fallocate(PUNCH_HOLE) on the
+	// reactor can override to "none" via LONGHORN_V2_LVOL_CLEAR_METHOD.
+	defaultLvolClearMethod = ""
+
+	// defaultLvstoreClusterSize controls the cluster_sz passed to
+	// bdev_lvol_create_lvstore on new disk registration. The value is fixed
+	// at lvstore creation time and cannot be changed; existing disks keep
+	// their original cluster size. Larger clusters reduce the per-cluster
+	// blob_sync_md cost that caps v2 replica rebuild throughput (upstream
+	// SPDK issue #359), at the cost of higher CoW amplification on
+	// snapshotted blobs. Override via LONGHORN_V2_LVSTORE_CLUSTER_SIZE
+	// (bytes, uint32).
+	defaultLvstoreClusterSize uint32 = 1 * 1024 * 1024
+
+	// defaultThinProvision controls the thin_provision flag passed to
+	// bdev_lvol_create. true (upstream default) allocates clusters
+	// lazily on first write, which triggers a per-cluster spdk_blob_sync_md
+	// barrier — a hard serialization point that caps first-write throughput
+	// on fresh regions at ~25 IOPS per blob on our hardware (slow mkfs on
+	// large volumes, slow rebuild shallow_copy, see SPDK #359). Set to
+	// false via LONGHORN_V2_LVOL_THIN_PROVISION=false for installs where
+	// the underlying bdev is already thick-allocated (e.g. a fixed-size
+	// LVM LV) so the blobstore-level thin tracking adds no capacity
+	// savings and only contributes latency.
+	defaultThinProvision = true
 )
 
 func init() {
@@ -70,6 +115,24 @@ func init() {
 	replicaFastIOFailTimeoutSec = envIntOrDefault("LONGHORN_V2_REPLICA_FAST_IO_FAIL_TIMEOUT_SEC", replicaFastIOFailTimeoutSec)
 	replicaTransportAckTimeout = envIntOrDefault("LONGHORN_V2_REPLICA_TRANSPORT_ACK_TIMEOUT", replicaTransportAckTimeout)
 	replicaKeepAliveTimeoutMs = envIntOrDefault("LONGHORN_V2_REPLICA_KEEP_ALIVE_TIMEOUT_MS", replicaKeepAliveTimeoutMs)
+	rebuildCtrlrLossTimeoutSec = envIntOrDefault("LONGHORN_V2_REBUILD_CTRLR_LOSS_TIMEOUT_SEC", rebuildCtrlrLossTimeoutSec)
+	rebuildFastIOFailTimeoutSec = envIntOrDefault("LONGHORN_V2_REBUILD_FAST_IO_FAIL_TIMEOUT_SEC", rebuildFastIOFailTimeoutSec)
+	if v, ok := os.LookupEnv("LONGHORN_V2_LVOL_CLEAR_METHOD"); ok {
+		defaultLvolClearMethod = strings.TrimSpace(v)
+	}
+	if v, ok := os.LookupEnv("LONGHORN_V2_LVSTORE_CLUSTER_SIZE"); ok {
+		if parsed, err := strconv.ParseUint(strings.TrimSpace(v), 10, 32); err == nil && parsed > 0 {
+			defaultLvstoreClusterSize = uint32(parsed)
+		}
+	}
+	if v, ok := os.LookupEnv("LONGHORN_V2_LVOL_THIN_PROVISION"); ok {
+		switch strings.ToLower(strings.TrimSpace(v)) {
+		case "0", "false", "no", "off":
+			defaultThinProvision = false
+		case "1", "true", "yes", "on":
+			defaultThinProvision = true
+		}
+	}
 }
 
 var (
