@@ -5,8 +5,7 @@ ARG ARCH=amd64
 ARG SRC_BRANCH=v1.11.x-linkpool
 ARG SRC_TAG
 
-RUN zypper -n ref && \
-    zypper update -y
+RUN zypper -n ref
 
 RUN zypper -n install jq wget
 
@@ -40,8 +39,7 @@ ARG SRC_BRANCH=v1.11.x-linkpool
 ARG SRC_TAG
 
 # Install build dependencies from zypper
-RUN zypper -n ref && \
-    zypper update -y
+RUN zypper -n ref
 
 RUN zypper -n install cmake gcc gcc13 xsltproc docbook-xsl-stylesheets git python311 python311-pip fuse3-devel jq nasm rdma-core-devel
 
@@ -89,8 +87,7 @@ FROM registry.suse.com/bci/bci-base:15.7@sha256:3292c81fb9e40b60903e6c88fac34e95
 ARG ARCH=amd64
 
 ## Install runtime dependencies from zypper
-RUN zypper -n ref && \
-    zypper update -y
+RUN zypper -n ref
 
 RUN zypper -n install kmod jq util-linux procps awk qemu-tools e2fsprogs xfsprogs python311-base device-mapper netcat fuse3-devel logrotate libcmocka-devel rdma-core libibverbs librdmacm1
 
