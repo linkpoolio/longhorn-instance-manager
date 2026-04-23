@@ -18,6 +18,7 @@ import (
 	spdkapi "github.com/longhorn/longhorn-spdk-engine/pkg/api"
 	spdkclient "github.com/longhorn/longhorn-spdk-engine/pkg/client"
 	rpc "github.com/longhorn/types/pkg/generated/imrpc"
+	spdkrpc "github.com/longhorn/types/pkg/generated/spdkrpc"
 
 	"github.com/longhorn/longhorn-instance-manager/pkg/client"
 	"github.com/longhorn/longhorn-instance-manager/pkg/meta"
@@ -171,7 +172,7 @@ func (ops V2DataEngineInstanceOps) InstanceCreate(req *rpc.InstanceCreateRequest
 	switch req.Spec.Type {
 	case types.InstanceTypeEngine:
 		engine, err := c.EngineCreate(req.Spec.Name, req.Spec.VolumeName, req.Spec.SpdkInstanceSpec.Frontend, req.Spec.SpdkInstanceSpec.Size, req.Spec.SpdkInstanceSpec.ReplicaAddressMap,
-			req.Spec.PortCount, req.Spec.SpdkInstanceSpec.SalvageRequested)
+			imrpcTransportMapToSPDKRPC(req.Spec.SpdkInstanceSpec.ReplicaTransportAddressMap), req.Spec.PortCount, req.Spec.SpdkInstanceSpec.SalvageRequested)
 		if err != nil {
 			return nil, err
 		}
@@ -854,6 +855,8 @@ func replicaResponseToInstanceResponse(r *spdkapi.Replica) *rpc.InstanceResponse
 			ErrorMsg:   r.ErrorMsg,
 			PortStart:  r.PortStart,
 			PortEnd:    r.PortEnd,
+			TcpPort:    r.TcpPort,
+			RdmaPort:   r.RdmaPort,
 			Conditions: make(map[string]bool),
 			Uuid:       r.UUID,
 		},
@@ -1134,4 +1137,26 @@ func (ops V2DataEngineInstanceOps) InstanceDeleteTarget(req *rpc.InstanceDeleteT
 	default:
 		return nil, grpcstatus.Errorf(grpccodes.InvalidArgument, "unknown instance type %v", req.Type)
 	}
+}
+
+// imrpcTransportMapToSPDKRPC converts the transport-address map carried in the
+// imrpc-layer SpdkInstanceSpec (manager → IM wire) to the spdkrpc-layer shape
+// expected by the SPDK engine service. The two message types are structurally
+// identical but live in different generated packages. Returns nil when the
+// input is empty so the downstream engine falls back to ReplicaAddressMap.
+func imrpcTransportMapToSPDKRPC(in map[string]*rpc.ReplicaTransportAddresses) map[string]*spdkrpc.ReplicaTransportAddresses {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make(map[string]*spdkrpc.ReplicaTransportAddresses, len(in))
+	for name, addrs := range in {
+		if addrs == nil {
+			continue
+		}
+		out[name] = &spdkrpc.ReplicaTransportAddresses{
+			TcpAddress:  addrs.TcpAddress,
+			RdmaAddress: addrs.RdmaAddress,
+		}
+	}
+	return out
 }
