@@ -17,7 +17,6 @@ ENV SRC_TAG=${SRC_TAG}
 
 # Install packages
 RUN zypper -n ref && \
-    zypper update -y && \
     zypper -n install cmake wget curl git less file \
     libglib-2_0-0 libkmod-devel libnl3-devel linux-glibc-devel pkg-config \
     psmisc tox qemu-tools fuse python3-devel zlib-devel zlib-devel-static \
