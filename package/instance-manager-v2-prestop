@@ -24,6 +24,22 @@ function cleanup_spdk_resources() {
     else
         log "Successfully sent SIGTERM to go-spdk-helper"
     fi
+
+    # Wait for spdk_tgt to fully exit before returning. Without this, kubelet's
+    # terminationGracePeriodSeconds clock can expire while SPDK is still
+    # flushing its blobstore, forcing SIGKILL mid-flush. That leaves the
+    # on-disk dirty bit set and the next boot runs a full blobstore recovery
+    # (15-30 min on a multi-TiB disk). Cleanly exiting here skips recovery
+    # entirely. Cap at 270s: grace period is 300s, leaving 30s headroom.
+    local deadline=$(( $(date +%s) + 270 ))
+    while pidof spdk_tgt > /dev/null 2>&1; do
+        if [[ $(date +%s) -ge ${deadline} ]]; then
+            log "Timed out waiting for spdk_tgt to exit; blobstore may recover on next boot"
+            return
+        fi
+        sleep 1
+    done
+    log "spdk_tgt exited cleanly after SIGTERM"
 }
 
 function get_v2_devices() {
