@@ -4,7 +4,7 @@ FROM registry.suse.com/bci/golang:1.26@sha256:51ebc98f5c11317c65308bca2a80fb79b6
 ARG TARGETARCH
 ARG http_proxy
 ARG https_proxy
-ARG SRC_BRANCH=master
+ARG SRC_BRANCH=v1.11.x-linkpool
 ARG SRC_TAG
 ARG CACHEBUST
 

@@ -5,14 +5,14 @@ MACHINE := longhorn
 # defined in TARGET_PLATFORMS, and must be a subset of the below:
 DEFAULT_PLATFORMS := linux/amd64,linux/arm64
 
-export SRC_BRANCH := $(shell bash -c 'source <(curl -s "https://raw.githubusercontent.com/longhorn/dep-versions/master/scripts/common.sh") && get_branch')
+export SRC_BRANCH := v1.11.x-linkpool
 export SRC_TAG := $(shell git tag --points-at HEAD | head -n 1)
 
 export CACHEBUST := $(shell date +%s)
 
 .PHONY: build validate test ci package
 build:
-	docker buildx build --target build-artifacts --output type=local,dest=. -f Dockerfile .
+	docker buildx build --platform linux/amd64 --target build-artifacts --output type=local,dest=. -f Dockerfile .
 
 validate:
 	docker buildx build --target validate -f Dockerfile .
@@ -24,6 +24,7 @@ ci:
 	docker buildx build --target ci-artifacts --output type=local,dest=. -f Dockerfile .
 
 package:
+	@file bin/longhorn-instance-manager 2>/dev/null | grep -q 'x86-64' || { echo "bin/longhorn-instance-manager missing or wrong arch (expected x86-64); run 'make build' first" >&2; exit 1; }
 	bash scripts/package
 
 .PHONY: buildx-machine

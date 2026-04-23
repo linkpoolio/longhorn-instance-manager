@@ -2,7 +2,7 @@
 FROM  registry.suse.com/bci/golang:1.26@sha256:51ebc98f5c11317c65308bca2a80fb79b683b706c40b2664c1152a04911ad69b AS gobuilder
 
 ARG ARCH=amd64
-ARG SRC_BRANCH=master
+ARG SRC_BRANCH=v1.11.x-linkpool
 ARG SRC_TAG
 
 RUN zypper -n ref && \
@@ -36,7 +36,7 @@ RUN export GRPC_HEALTH_PROBE_DOWNLOAD_URL=$(wget -qO- https://api.github.com/rep
 FROM registry.suse.com/bci/bci-base:15.7@sha256:3292c81fb9e40b60903e6c88fac34e955b6d5b3acd3eb055d02d5c1538a72aea AS cbuilder
 
 ARG ARCH=amd64
-ARG SRC_BRANCH=master
+ARG SRC_BRANCH=v1.11.x-linkpool
 ARG SRC_TAG
 
 # Install build dependencies from zypper
