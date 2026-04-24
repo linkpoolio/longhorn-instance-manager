@@ -45,6 +45,21 @@ function generate_nvme_hostid_and_hostnqn() {
 
 function enable_spdk_tgt() {
     local options=("$@")
+    # Containerd spawns privileged containers with RLIMIT_MEMLOCK hard=8 MiB.
+    # SPDK pins hugepage ranges as RDMA Memory Regions; with an 8 MiB cap it
+    # can only register a sliver of the --mem-size pool and every IO whose
+    # buffer lands outside the window serializes through a bounce buffer,
+    # observed as ~400 ms per 128 KiB op on RDMA. The privileged container
+    # already holds CAP_SYS_RESOURCE, so prlimit on our own shell raises the
+    # hard cap to unlimited; spdk_tgt inherits it.
+    prlimit --pid $$ --memlock=unlimited:unlimited 2>/dev/null || true
+    # --wait-for-rpc keeps spdk_tgt paused before subsystem initialisation so
+    # that the Go side can call iobuf_set_options / bdev_nvme_set_options /
+    # nvmf_create_transport with tuned opts; then it drives framework_start_init
+    # to complete boot. Without this the default iobuf pools (large=1024,
+    # small=8192) lock in before we can grow them and any tuned transport
+    # opts exceed the pool, failing accel/bdev channel creation with -ENOMEM.
+    options+=("--wait-for-rpc")
     echo "Enabling spdk_tgt with options: ${options[*]}"
     spdk_tgt "${options[@]}" 2>&1 | tee -a /log/spdk_tgt.log &
 
