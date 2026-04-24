@@ -14,5 +14,4 @@ else
 fi
 
 GITCOMMIT=$(git rev-parse HEAD)
-BUILDDATE=$(date -u --rfc-3339=seconds)
-BUILDDATE=${BUILDDATE// /T}
+BUILDDATE=$(date -u +%Y-%m-%dT%H:%M:%S+00:00)
