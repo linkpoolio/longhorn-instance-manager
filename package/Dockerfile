@@ -81,6 +81,13 @@ RUN export REPO_OVERRIDE="" && \
     export COMMIT_ID_OVERRIDE="" && \
     bash /usr/src/dep-versions/scripts/build-nvme-cli.sh "${REPO_OVERRIDE}" "${COMMIT_ID_OVERRIDE}"
 
+# Build libqcow (needed by longhorn-engine's qcow package via cgo). Upstream's
+# build flow expected the IM Go binary to be cross-compiled outside Docker, so
+# this wasn't in the cbuilder before; with the in-Docker build it is.
+RUN export REPO_OVERRIDE="" && \
+    export COMMIT_ID_OVERRIDE="" && \
+    bash /usr/src/dep-versions/scripts/build-libqcow.sh "${REPO_OVERRIDE}" "${COMMIT_ID_OVERRIDE}"
+
 # Stage 3: copy binaries to release image
 FROM registry.suse.com/bci/bci-base:15.7@sha256:3292c81fb9e40b60903e6c88fac34e955b6d5b3acd3eb055d02d5c1538a72aea AS release
 
@@ -148,13 +155,14 @@ ARG VERSION=dev
 
 RUN zypper -n install zlib-devel fuse3-devel gcc
 
-# Pull cbuilder's installed C libs/headers (libqcow, libjson-c, liblonghorn,
-# nvme, etc) so cgo can link against them.
+# Pull cbuilder's installed C libs/headers (liblonghorn, libjson-c, libqcow,
+# etc) so cgo can link against them.
 COPY --from=cbuilder /usr/local/include /usr/local/include
 COPY --from=cbuilder /usr/local/lib64 /usr/local/lib64
+RUN ldconfig
 
 ENV CGO_CFLAGS="-I/usr/local/include" \
-    CGO_LDFLAGS="-L/usr/local/lib64"
+    CGO_LDFLAGS="-L/usr/local/lib64 -L/usr/local/lib"
 
 WORKDIR /src
 COPY . /src
