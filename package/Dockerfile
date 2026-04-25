@@ -169,8 +169,7 @@ COPY . /src
 
 RUN go mod vendor && \
     go build -o /usr/local/bin/longhorn-instance-manager \
-      -tags netgo \
-      -ldflags "-X main.Version=${VERSION} -linkmode external -extldflags -static" \
+      -ldflags "-X main.Version=${VERSION}" \
       .
 
 FROM release AS release-final
