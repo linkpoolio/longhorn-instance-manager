@@ -139,6 +139,12 @@ COPY --from=cbuilder \
    /usr/local/lib64 \
    /usr/local/lib64
 
+# libqcow.so lives under /usr/local/lib (autotools default), so the IM Go
+# binary (dynamically linked) needs it on the runtime ld path.
+COPY --from=cbuilder \
+   /usr/local/lib \
+   /usr/local/lib
+
 COPY --from=cbuilder \
    /usr/lib64 \
    /usr/lib64
@@ -156,8 +162,10 @@ ARG VERSION=dev
 RUN zypper -n install zlib-devel fuse3-devel gcc
 
 # Pull cbuilder's installed C libs/headers (liblonghorn, libjson-c, libqcow,
-# etc) so cgo can link against them.
+# etc). libqcow's autotools install puts .so in /usr/local/lib, others go
+# to /usr/local/lib64 — copy both.
 COPY --from=cbuilder /usr/local/include /usr/local/include
+COPY --from=cbuilder /usr/local/lib /usr/local/lib
 COPY --from=cbuilder /usr/local/lib64 /usr/local/lib64
 RUN ldconfig
 
