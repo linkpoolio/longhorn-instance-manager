@@ -22,8 +22,9 @@ IID_FILE_FLAG=${IID_FILE_FLAG:-''}
 SRC_BRANCH=${SRC_BRANCH:-''}
 SRC_TAG=${SRC_TAG:-''}
 
-# TODO: implement self-contained build
-[[ ! -x ./bin/longhorn-instance-manager ]] && ./scripts/build
+# Self-contained build: the IM Go binary is now compiled inside the Dockerfile's
+# imbuilder stage using cbuilder's libqcow/libjson-c/liblonghorn. No host
+# cross-compile required (works from macOS hosts without a Linux toolchain).
 
 if [[ -z $TAG ]]; then
     if API_VERSION=$(./bin/longhorn-instance-manager version --client-only | jq ".clientVersion.instanceManagerAPIVersion"); then
