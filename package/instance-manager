@@ -93,6 +93,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         -m|--spdk-cpumask)
             spdk_options+=("-m" "$2")
+            # Export so the IM Go process can derive accel_mlx5 num_requests
+            # from the actual SPDK core count (not runtime.NumCPU(), which
+            # returns the pod's cgroup-visible CPUs and can mismatch).
+            export LONGHORN_V2_SPDK_CPUMASK="$2"
             shift
             ;;
         -s|--spdk-memory-size)
