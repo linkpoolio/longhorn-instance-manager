@@ -141,7 +141,33 @@ RUN find /usr/lib64 -depth -type f -name 'wininst-*.exe' -exec rm -f {} \;
 
 RUN ldconfig
 
-COPY bin/longhorn-instance-manager /usr/local/bin/
+# Stage 4: build the longhorn-instance-manager Go binary using cbuilder libs/headers
+FROM gobuilder AS imbuilder
+
+ARG VERSION=dev
+
+RUN zypper -n install zlib-devel fuse3-devel gcc
+
+# Pull cbuilder's installed C libs/headers (libqcow, libjson-c, liblonghorn,
+# nvme, etc) so cgo can link against them.
+COPY --from=cbuilder /usr/local/include /usr/local/include
+COPY --from=cbuilder /usr/local/lib64 /usr/local/lib64
+
+ENV CGO_CFLAGS="-I/usr/local/include" \
+    CGO_LDFLAGS="-L/usr/local/lib64"
+
+WORKDIR /src
+COPY . /src
+
+RUN go mod vendor && \
+    go build -o /usr/local/bin/longhorn-instance-manager \
+      -tags netgo \
+      -ldflags "-X main.Version=${VERSION} -linkmode external -extldflags -static" \
+      .
+
+FROM release AS release-final
+
+COPY --from=imbuilder /usr/local/bin/longhorn-instance-manager /usr/local/bin/
 COPY package/instance-manager /usr/local/bin/
 COPY package/instance-manager-v2-prestop /usr/local/bin/
 COPY package/exec-logrotate /usr/local/bin/
