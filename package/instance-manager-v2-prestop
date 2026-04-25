@@ -17,6 +17,23 @@ function cleanup_spdk_resources() {
         log "Removed device file: $device_file"
     done
 
+    # Drain NVMe-oF listeners BEFORE killing spdk_tgt. Removing each listener
+    # tells SPDK to send a clean RDMA/TCP disconnect frame to every connected
+    # initiator. Without this, peer bdev_nvme controllers see only an
+    # ungraceful transport drop and wedge in "failover already in progress"
+    # for ctrlr_loss_timeout — which on the peer side can starve its reactor
+    # and trip its own liveness probe (observed 2026-04-25 ma5-worker-9 drain).
+    # Best-effort: per-listener failures don't block kill-instance.
+    log "Draining NVMe-oF listeners so peer initiators see a clean disconnect..."
+    if go-spdk-helper nvme-of drain-listeners; then
+        log "Drained NVMe-oF listeners successfully"
+    else
+        log "Failed to drain NVMe-oF listeners (continuing anyway)"
+    fi
+    # Brief settle so the NIC can flush the disconnect frames before the
+    # transport tears down with spdk_tgt's exit.
+    sleep 1
+
     log "Sending SIGTERM to go-spdk-helper to stop spdk_tgt..."
     go-spdk-helper kill-instance --sig-name SIGTERM
     if [[ $? -ne 0 ]]; then
