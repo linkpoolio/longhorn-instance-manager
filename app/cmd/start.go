@@ -259,40 +259,15 @@ func start(c *cli.Context) (err error) {
 
 	g, _ := errgroup.WithContext(ctx)
 
-	// Register signal handler. After SIGTERM/SIGINT we have a hard 10s deadline
-	// to exit; anything past that and we os.Exit so the kubelet doesn't have to
-	// wait the full terminationGracePeriodSeconds (300s) for SIGKILL. The
-	// preStop hook has already done the SPDK-side graceful drain at this
-	// point — our job here is only to release the gRPC listeners and exit.
+	// Register signal handler
 	sigs := make(chan os.Signal, 1)
 	signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM)
 	g.Go(func() error {
 		sig := <-sigs
 		logrus.Infof("Instance Manager received %v to exit", sig)
 
-		// Watchdog: if the graceful path doesn't return within 10s, force
-		// process exit. preStop has already cleaned up SPDK; lingering only
-		// stalls the next pod.
-		go func() {
-			time.Sleep(10 * time.Second)
-			logrus.Warn("Instance Manager exit watchdog tripped; forcing os.Exit(0)")
-			os.Exit(0)
-		}()
-
-		for name, server := range servers {
-			logrus.Infof("Stopping gRPC server %s", name)
-			done := make(chan struct{})
-			go func(s *grpc.Server) {
-				s.GracefulStop()
-				close(done)
-			}(server)
-			select {
-			case <-done:
-				logrus.Infof("gRPC server %s stopped gracefully", name)
-			case <-time.After(3 * time.Second):
-				logrus.Warnf("gRPC server %s GracefulStop timed out, forcing Stop", name)
-				server.Stop()
-			}
+		for _, server := range servers {
+			server.Stop()
 		}
 		return nil
 	})
