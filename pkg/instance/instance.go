@@ -41,6 +41,7 @@ type InstanceOps interface {
 	InstanceResume(*rpc.InstanceResumeRequest) (*emptypb.Empty, error)
 	InstanceSwitchOverTarget(*rpc.InstanceSwitchOverTargetRequest) (*emptypb.Empty, error)
 	InstanceDeleteTarget(*rpc.InstanceDeleteTargetRequest) (*emptypb.Empty, error)
+	InstanceSetQosLimit(*rpc.InstanceSetQosLimitRequest) (*emptypb.Empty, error)
 
 	LogSetLevel(context.Context, *rpc.LogSetLevelRequest) (*emptypb.Empty, error)
 	LogSetFlags(context.Context, *rpc.LogSetFlagsRequest) (*emptypb.Empty, error)
@@ -172,7 +173,8 @@ func (ops V2DataEngineInstanceOps) InstanceCreate(req *rpc.InstanceCreateRequest
 	switch req.Spec.Type {
 	case types.InstanceTypeEngine:
 		engine, err := c.EngineCreate(req.Spec.Name, req.Spec.VolumeName, req.Spec.SpdkInstanceSpec.Frontend, req.Spec.SpdkInstanceSpec.Size, req.Spec.SpdkInstanceSpec.ReplicaAddressMap,
-			imrpcTransportMapToSPDKRPC(req.Spec.SpdkInstanceSpec.ReplicaTransportAddressMap), req.Spec.PortCount, req.Spec.SpdkInstanceSpec.SalvageRequested)
+			imrpcTransportMapToSPDKRPC(req.Spec.SpdkInstanceSpec.ReplicaTransportAddressMap), req.Spec.PortCount, req.Spec.SpdkInstanceSpec.SalvageRequested,
+			imrpcQosLimitsToSPDKRPC(req.Spec.SpdkInstanceSpec.QosLimits))
 		if err != nil {
 			return nil, err
 		}
@@ -1136,6 +1138,69 @@ func (ops V2DataEngineInstanceOps) InstanceDeleteTarget(req *rpc.InstanceDeleteT
 		return nil, grpcstatus.Errorf(grpccodes.InvalidArgument, "target deletion is not supported for instance type %v", req.Type)
 	default:
 		return nil, grpcstatus.Errorf(grpccodes.InvalidArgument, "unknown instance type %v", req.Type)
+	}
+}
+
+// InstanceSetQosLimit applies new QoS limits to a running instance at runtime.
+// Dispatches to the per-engine V1/V2 ops handler.
+func (s *Server) InstanceSetQosLimit(ctx context.Context, req *rpc.InstanceSetQosLimitRequest) (*emptypb.Empty, error) {
+	logrus.WithFields(logrus.Fields{
+		"name":       req.Name,
+		"type":       req.Type,
+		"dataEngine": req.DataEngine,
+	}).Info("Setting QoS limits on instance")
+
+	ops, ok := s.ops[req.DataEngine]
+	if !ok {
+		return nil, grpcstatus.Errorf(grpccodes.Unimplemented, "unsupported data engine %v", req.DataEngine)
+	}
+	return ops.InstanceSetQosLimit(req)
+}
+
+func (ops V1DataEngineInstanceOps) InstanceSetQosLimit(req *rpc.InstanceSetQosLimitRequest) (*emptypb.Empty, error) {
+	return nil, grpcstatus.Error(grpccodes.Unimplemented, "v1 data engine does not support QoS limits")
+}
+
+func (ops V2DataEngineInstanceOps) InstanceSetQosLimit(req *rpc.InstanceSetQosLimitRequest) (*emptypb.Empty, error) {
+	if req.Type != types.InstanceTypeEngine {
+		return nil, grpcstatus.Errorf(grpccodes.InvalidArgument, "QoS limits are only supported for engine instances; got type %v", req.Type)
+	}
+	if req.QosLimits == nil {
+		return nil, grpcstatus.Error(grpccodes.InvalidArgument, "qos_limits is required (use all-zero fields for unlimited)")
+	}
+	c, err := spdkclient.NewSPDKClient(ops.spdkServiceAddress)
+	if err != nil {
+		return nil, toSPDKGRPCError(err, grpccodes.Internal, "failed to create SPDK client")
+	}
+	defer func() {
+		if closeErr := c.Close(); closeErr != nil {
+			logrus.WithFields(logrus.Fields{
+				"name":       req.Name,
+				"dataEngine": req.DataEngine,
+			}).WithError(closeErr).Warn("Failed to close SPDK client")
+		}
+	}()
+
+	if err := c.EngineSetQosLimit(req.Name, imrpcQosLimitsToSPDKRPC(req.QosLimits)); err != nil {
+		return nil, toSPDKGRPCError(err, grpccodes.Internal, "failed to set QoS limits on engine %v", req.Name)
+	}
+	return &emptypb.Empty{}, nil
+}
+
+// imrpcQosLimitsToSPDKRPC converts QoS limits from the imrpc layer (manager →
+// IM wire on SpdkInstanceSpec.qos_limits) to the spdkrpc layer expected by the
+// SPDK engine service. Two structurally identical messages in different
+// generated packages. nil-in / nil-out so the engine sees no cap when QoS
+// isn't configured.
+func imrpcQosLimitsToSPDKRPC(in *rpc.QosLimits) *spdkrpc.QosLimits {
+	if in == nil {
+		return nil
+	}
+	return &spdkrpc.QosLimits{
+		RwIosPerSec: in.RwIosPerSec,
+		RwMbPerSec:  in.RwMbPerSec,
+		RMbPerSec:   in.RMbPerSec,
+		WMbPerSec:   in.WMbPerSec,
 	}
 }
 
