@@ -1,7 +1,16 @@
 #!/bin/bash
 
+# kubelet runs PreStop as an exec against the container with its own
+# stdout/stderr that promtail does not tail (only /var/log/pods/<pod>/<ctr>/0.log
+# is tailed, which is the container's PID 1 stdout). Redirect to PID 1's fd 1
+# so the PreStop log lines join the container's main stream and ship to Loki —
+# without this, "Drained N NVMe-oF listeners" and the rest of the graceful
+# shutdown trace are invisible after the pod terminates and we can only infer
+# success from the absence of failover-wedge noise on the peer's syslog.
+exec >> /proc/1/fd/1 2>&1
+
 log() {
-    echo "$(date '+%Y-%m-%d %H:%M:%S.%N') $*"
+    echo "[prestop] $(date -u '+%Y-%m-%dT%H:%M:%S.%NZ') $*"
 }
 
 function cleanup_spdk_resources() {
