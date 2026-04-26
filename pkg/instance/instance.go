@@ -443,7 +443,6 @@ func (ops V2DataEngineInstanceOps) InstanceList(instances map[string]*rpc.Instan
 		instances[engine.Name] = engineResponseToInstanceResponse(engine)
 	}
 
-	_ = engineFrontendResponseToInstanceResponse
 	return nil
 }
 
