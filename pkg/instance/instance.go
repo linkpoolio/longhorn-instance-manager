@@ -172,7 +172,8 @@ func (ops V2DataEngineInstanceOps) InstanceCreate(req *rpc.InstanceCreateRequest
 	switch req.Spec.Type {
 	case types.InstanceTypeEngine:
 		engine, err := c.EngineCreate(req.Spec.Name, req.Spec.VolumeName, req.Spec.SpdkInstanceSpec.Frontend, req.Spec.SpdkInstanceSpec.Size, req.Spec.SpdkInstanceSpec.ReplicaAddressMap,
-			imrpcTransportMapToSPDKRPC(req.Spec.SpdkInstanceSpec.ReplicaTransportAddressMap), req.Spec.PortCount, req.Spec.SpdkInstanceSpec.SalvageRequested)
+			imrpcTransportMapToSPDKRPC(req.Spec.SpdkInstanceSpec.ReplicaTransportAddressMap), req.Spec.PortCount, req.Spec.SpdkInstanceSpec.SalvageRequested,
+			imrpcQosLimitsToSPDKRPC(req.Spec.SpdkInstanceSpec.QosLimits))
 		if err != nil {
 			return nil, err
 		}
@@ -1136,6 +1137,23 @@ func (ops V2DataEngineInstanceOps) InstanceDeleteTarget(req *rpc.InstanceDeleteT
 		return nil, grpcstatus.Errorf(grpccodes.InvalidArgument, "target deletion is not supported for instance type %v", req.Type)
 	default:
 		return nil, grpcstatus.Errorf(grpccodes.InvalidArgument, "unknown instance type %v", req.Type)
+	}
+}
+
+// imrpcQosLimitsToSPDKRPC converts QoS limits from the imrpc layer (manager →
+// IM wire on SpdkInstanceSpec.qos_limits) to the spdkrpc layer expected by the
+// SPDK engine service. Two structurally identical messages in different
+// generated packages. nil-in / nil-out so the engine sees no cap when QoS
+// isn't configured.
+func imrpcQosLimitsToSPDKRPC(in *rpc.QosLimits) *spdkrpc.QosLimits {
+	if in == nil {
+		return nil
+	}
+	return &spdkrpc.QosLimits{
+		RwIosPerSec: in.RwIosPerSec,
+		RwMbPerSec:  in.RwMbPerSec,
+		RMbPerSec:   in.RMbPerSec,
+		WMbPerSec:   in.WMbPerSec,
 	}
 }
 
