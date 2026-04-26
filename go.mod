@@ -129,6 +129,6 @@ require (
 
 replace github.com/longhorn/go-spdk-helper => github.com/linkpoolio/go-spdk-helper v0.6.1-0.20260425145436-8c64226a8d15
 
-replace github.com/longhorn/types => github.com/linkpoolio/types v0.0.0-20260423173434-e6daaeb4d4f4
+replace github.com/longhorn/types => github.com/linkpoolio/types v0.0.0-20260426093344-f10eaa212bd4
 
-replace github.com/longhorn/longhorn-spdk-engine => github.com/linkpoolio/longhorn-spdk-engine v0.0.0-20260426082238-f884067269eb
+replace github.com/longhorn/longhorn-spdk-engine => github.com/linkpoolio/longhorn-spdk-engine v0.0.0-20260426093628-0b8dcfac9042
