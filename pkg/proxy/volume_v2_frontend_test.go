@@ -21,10 +21,10 @@ type fakeV2FrontendClient struct {
 	engines   map[string]*api.Engine
 	frontends map[string]*api.EngineFrontend
 
-	engineGetErr       error
-	frontendGetErr     error
-	frontendCreateErr  error
-	frontendDeleteErr  error
+	engineGetErr      error
+	frontendGetErr    error
+	frontendCreateErr error
+	frontendDeleteErr error
 
 	createCalls []engineFrontendCreateCall
 	deleteCalls []string
