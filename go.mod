@@ -131,4 +131,4 @@ replace github.com/longhorn/go-spdk-helper => github.com/linkpoolio/go-spdk-help
 
 replace github.com/longhorn/types => github.com/linkpoolio/types v0.0.0-20260426100954-ba149dfb887b
 
-replace github.com/longhorn/longhorn-spdk-engine => github.com/linkpoolio/longhorn-spdk-engine v0.0.0-20260429162954-3b24da676b89
+replace github.com/longhorn/longhorn-spdk-engine => github.com/linkpoolio/longhorn-spdk-engine v0.0.0-20260506091015-dd5a335d8bd4
