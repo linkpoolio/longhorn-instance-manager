@@ -1,11 +1,45 @@
 #!/bin/bash
 
+# kubelet runs PreStop as an exec against the container with its own
+# stdout/stderr — log shippers typically only tail the container's PID 1
+# stdout (/var/log/pods/<pod>/<ctr>/0.log). Redirect this script's output
+# to PID 1's fd 1 so the graceful-shutdown trace joins the container's
+# main log stream rather than being lost when the pod terminates.
+exec >> /proc/1/fd/1 2>&1
+
 log() {
-    echo "$(date '+%Y-%m-%d %H:%M:%S.%N') $*"
+    echo "[prestop] $(date -u '+%Y-%m-%dT%H:%M:%S.%NZ') $*"
 }
 
 function cleanup_spdk_resources() {
     log "Caught termination signal. Cleaning up SPDK resources..."
+
+    local v2_devices=($(get_v2_devices))
+    for device in "${v2_devices[@]}"; do
+        dmsetup remove "$device"
+        log "Removed device-mapper device: $device"
+
+        device_file="/host/dev/longhorn/$device"
+        rm "$device_file"
+        log "Removed device file: $device_file"
+    done
+
+    # Drain NVMe-oF listeners BEFORE killing spdk_tgt. Removing each listener
+    # tells SPDK to send a clean RDMA/TCP disconnect frame to every connected
+    # initiator. Without this, peer bdev_nvme controllers see only an
+    # ungraceful transport drop and wedge in "failover already in progress"
+    # for ctrlr_loss_timeout, which on the peer side can starve its reactor
+    # and trip its own liveness probe. Best-effort: per-listener failures
+    # don't block kill-instance.
+    log "Draining NVMe-oF listeners so peer initiators see a clean disconnect..."
+    if go-spdk-helper nvme-of drain-listeners; then
+        log "Drained NVMe-oF listeners successfully"
+    else
+        log "Failed to drain NVMe-oF listeners (continuing anyway)"
+    fi
+    # Brief settle so the NIC can flush the disconnect frames before the
+    # transport tears down with spdk_tgt's exit.
+    sleep 1
 
     log "Sending SIGTERM to go-spdk-helper to stop spdk_tgt..."
     go-spdk-helper kill-instance --sig-name SIGTERM
@@ -15,25 +49,46 @@ function cleanup_spdk_resources() {
         log "Successfully sent SIGTERM to go-spdk-helper"
     fi
 
-    local grace_period=60
-    local elapsed=0
-    while [[ $elapsed -lt $grace_period ]]; do
-        if ! pgrep -f "^spdk_tgt" > /dev/null 2>&1; then
-            log "spdk_tgt process has stopped"
+    # Wait for spdk_tgt to fully exit before returning. Without this, kubelet's
+    # terminationGracePeriodSeconds clock can expire while SPDK is still
+    # flushing its blobstore, forcing SIGKILL mid-flush. That leaves the
+    # on-disk dirty bit set and the next boot runs a full blobstore recovery
+    # (15-30 min on a multi-TiB disk). Cleanly exiting here skips recovery
+    # entirely. Cap at 270s: grace period is 300s, leaving 30s headroom.
+    local deadline=$(( $(date +%s) + 270 ))
+    while pidof spdk_tgt > /dev/null 2>&1; do
+        if [[ $(date +%s) -ge ${deadline} ]]; then
+            log "Timed out waiting for spdk_tgt to exit; blobstore may recover on next boot"
             return
         fi
         sleep 1
-        elapsed=$((elapsed + 1))
-        log "Waiting for spdk_tgt to stop... (${elapsed}/${grace_period}s)"
+    done
+    log "spdk_tgt exited cleanly after SIGTERM"
+}
+
+function get_v2_devices() {
+    local dm_devices
+    dm_devices=$(dmsetup ls 2>/dev/null | awk '{print $1}')
+    local v2_devices=()
+
+    if [[ ! -d /host/dev/longhorn/ ]]; then
+        echo "${v2_devices[@]}"
+        return
+    fi
+
+    local device_files
+    device_files=$(ls /host/dev/longhorn/)
+
+    for dm_device in $dm_devices; do
+        for device_file in $device_files; do
+            if [[ "$dm_device" == "$device_file" ]]; then
+                v2_devices+=("$dm_device")
+                break
+            fi
+        done
     done
 
-    log "spdk_tgt did not stop within ${grace_period}s grace period, sending SIGKILL..."
-    pkill -KILL -f "^spdk_tgt"
-    if [[ $? -eq 0 ]]; then
-        log "Successfully sent SIGKILL to spdk_tgt"
-    else
-        log "Failed to send SIGKILL to spdk_tgt (process may have already exited)"
-    fi
+    echo "${v2_devices[@]}"
 }
 
 cleanup_spdk_resources
