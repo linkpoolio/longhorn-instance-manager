@@ -18,6 +18,7 @@ import (
 	spdkapi "github.com/longhorn/longhorn-spdk-engine/pkg/api"
 	spdkclient "github.com/longhorn/longhorn-spdk-engine/pkg/client"
 	rpc "github.com/longhorn/types/pkg/generated/imrpc"
+	spdkrpc "github.com/longhorn/types/pkg/generated/spdkrpc"
 
 	"github.com/longhorn/longhorn-instance-manager/pkg/client"
 	"github.com/longhorn/longhorn-instance-manager/pkg/meta"
@@ -40,6 +41,7 @@ type InstanceOps interface {
 	InstanceResume(*rpc.InstanceResumeRequest) (*emptypb.Empty, error)
 	InstanceSwitchOverTarget(*rpc.InstanceSwitchOverTargetRequest) (*emptypb.Empty, error)
 	InstanceDeleteTarget(*rpc.InstanceDeleteTargetRequest) (*emptypb.Empty, error)
+	InstanceSetQosLimit(*rpc.InstanceSetQosLimitRequest) (*emptypb.Empty, error)
 
 	LogSetLevel(context.Context, *rpc.LogSetLevelRequest) (*emptypb.Empty, error)
 	LogSetFlags(context.Context, *rpc.LogSetFlagsRequest) (*emptypb.Empty, error)
@@ -171,7 +173,8 @@ func (ops V2DataEngineInstanceOps) InstanceCreate(req *rpc.InstanceCreateRequest
 	switch req.Spec.Type {
 	case types.InstanceTypeEngine:
 		engine, err := c.EngineCreate(req.Spec.Name, req.Spec.VolumeName, req.Spec.SpdkInstanceSpec.Frontend, req.Spec.SpdkInstanceSpec.Size, req.Spec.SpdkInstanceSpec.ReplicaAddressMap,
-			req.Spec.PortCount, req.Spec.SpdkInstanceSpec.SalvageRequested, req.Spec.SpdkInstanceSpec.SnapshotMaxCount)
+			imrpcTransportMapToSPDKRPC(req.Spec.SpdkInstanceSpec.ReplicaTransportAddressMap), req.Spec.PortCount, req.Spec.SpdkInstanceSpec.SalvageRequested,
+			req.Spec.SpdkInstanceSpec.SnapshotMaxCount, imrpcQosLimitsToSPDKRPC(req.Spec.SpdkInstanceSpec.QosLimits))
 		if err != nil {
 			return nil, err
 		}
@@ -440,13 +443,6 @@ func (ops V2DataEngineInstanceOps) InstanceList(instances map[string]*rpc.Instan
 		instances[engine.Name] = engineResponseToInstanceResponse(engine)
 	}
 
-	engineFrontends, err := c.EngineFrontendList()
-	if err != nil {
-		return err
-	}
-	for _, engineFrontend := range engineFrontends {
-		instances[engineFrontend.Name] = engineFrontendResponseToInstanceResponse(engineFrontend)
-	}
 	return nil
 }
 
@@ -860,6 +856,8 @@ func replicaResponseToInstanceResponse(r *spdkapi.Replica) *rpc.InstanceResponse
 			ErrorMsg:   r.ErrorMsg,
 			PortStart:  r.PortStart,
 			PortEnd:    r.PortEnd,
+			TcpPort:    r.TcpPort,
+			RdmaPort:   r.RdmaPort,
 			Conditions: make(map[string]bool),
 			Uuid:       r.UUID,
 		},
@@ -1140,4 +1138,89 @@ func (ops V2DataEngineInstanceOps) InstanceDeleteTarget(req *rpc.InstanceDeleteT
 	default:
 		return nil, grpcstatus.Errorf(grpccodes.InvalidArgument, "unknown instance type %v", req.Type)
 	}
+}
+
+// InstanceSetQosLimit applies new QoS limits to a running instance at runtime.
+// Dispatches to the per-engine V1/V2 ops handler.
+func (s *Server) InstanceSetQosLimit(ctx context.Context, req *rpc.InstanceSetQosLimitRequest) (*emptypb.Empty, error) {
+	logrus.WithFields(logrus.Fields{
+		"name":       req.Name,
+		"type":       req.Type,
+		"dataEngine": req.DataEngine,
+	}).Info("Setting QoS limits on instance")
+
+	ops, ok := s.ops[req.DataEngine]
+	if !ok {
+		return nil, grpcstatus.Errorf(grpccodes.Unimplemented, "unsupported data engine %v", req.DataEngine)
+	}
+	return ops.InstanceSetQosLimit(req)
+}
+
+func (ops V1DataEngineInstanceOps) InstanceSetQosLimit(req *rpc.InstanceSetQosLimitRequest) (*emptypb.Empty, error) {
+	return nil, grpcstatus.Error(grpccodes.Unimplemented, "v1 data engine does not support QoS limits")
+}
+
+func (ops V2DataEngineInstanceOps) InstanceSetQosLimit(req *rpc.InstanceSetQosLimitRequest) (*emptypb.Empty, error) {
+	if req.Type != types.InstanceTypeEngine {
+		return nil, grpcstatus.Errorf(grpccodes.InvalidArgument, "QoS limits are only supported for engine instances; got type %v", req.Type)
+	}
+	if req.QosLimits == nil {
+		return nil, grpcstatus.Error(grpccodes.InvalidArgument, "qos_limits is required (use all-zero fields for unlimited)")
+	}
+	c, err := spdkclient.NewSPDKClient(ops.spdkServiceAddress)
+	if err != nil {
+		return nil, toSPDKGRPCError(err, grpccodes.Internal, "failed to create SPDK client")
+	}
+	defer func() {
+		if closeErr := c.Close(); closeErr != nil {
+			logrus.WithFields(logrus.Fields{
+				"name":       req.Name,
+				"dataEngine": req.DataEngine,
+			}).WithError(closeErr).Warn("Failed to close SPDK client")
+		}
+	}()
+
+	if err := c.EngineSetQosLimit(req.Name, imrpcQosLimitsToSPDKRPC(req.QosLimits)); err != nil {
+		return nil, toSPDKGRPCError(err, grpccodes.Internal, "failed to set QoS limits on engine %v", req.Name)
+	}
+	return &emptypb.Empty{}, nil
+}
+
+// imrpcQosLimitsToSPDKRPC converts QoS limits from the imrpc layer (manager →
+// IM wire on SpdkInstanceSpec.qos_limits) to the spdkrpc layer expected by the
+// SPDK engine service. Two structurally identical messages in different
+// generated packages. nil-in / nil-out so the engine sees no cap when QoS
+// isn't configured.
+func imrpcQosLimitsToSPDKRPC(in *rpc.QosLimits) *spdkrpc.QosLimits {
+	if in == nil {
+		return nil
+	}
+	return &spdkrpc.QosLimits{
+		RwIosPerSec: in.RwIosPerSec,
+		RwMbPerSec:  in.RwMbPerSec,
+		RMbPerSec:   in.RMbPerSec,
+		WMbPerSec:   in.WMbPerSec,
+	}
+}
+
+// imrpcTransportMapToSPDKRPC converts the transport-address map carried in the
+// imrpc-layer SpdkInstanceSpec (manager → IM wire) to the spdkrpc-layer shape
+// expected by the SPDK engine service. The two message types are structurally
+// identical but live in different generated packages. Returns nil when the
+// input is empty so the downstream engine falls back to ReplicaAddressMap.
+func imrpcTransportMapToSPDKRPC(in map[string]*rpc.ReplicaTransportAddresses) map[string]*spdkrpc.ReplicaTransportAddresses {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make(map[string]*spdkrpc.ReplicaTransportAddresses, len(in))
+	for name, addrs := range in {
+		if addrs == nil {
+			continue
+		}
+		out[name] = &spdkrpc.ReplicaTransportAddresses{
+			TcpAddress:  addrs.TcpAddress,
+			RdmaAddress: addrs.RdmaAddress,
+		}
+	}
+	return out
 }
