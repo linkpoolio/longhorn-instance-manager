@@ -1,5 +1,6 @@
 #!/bin/bash
 set -e
+set -o pipefail
 
 source $(dirname $0)/version
 
@@ -27,7 +28,7 @@ SRC_TAG=${SRC_TAG:-''}
 # cross-compile required (works from macOS hosts without a Linux toolchain).
 
 if [[ -z $TAG ]]; then
-    if API_VERSION=$(./bin/longhorn-instance-manager version --client-only | jq ".clientVersion.instanceManagerAPIVersion"); then
+    if [[ -x ./bin/longhorn-instance-manager ]] && API_VERSION=$(./bin/longhorn-instance-manager version --client-only | jq ".clientVersion.instanceManagerAPIVersion"); then
       TAG="v${API_VERSION}_$(date -u +%Y%m%d)"
     else
       TAG="${VERSION}"
@@ -73,6 +74,7 @@ fi
 IMAGE_ARGS=(--build-arg ARCH="${ARCH}")
 [[ -n "${SRC_BRANCH}" ]] && IMAGE_ARGS+=(--build-arg SRC_BRANCH="${SRC_BRANCH}")
 [[ -n "${SRC_TAG}" ]] && IMAGE_ARGS+=(--build-arg SRC_TAG="${SRC_TAG}")
+[[ -n "${VERSION}" ]] && IMAGE_ARGS+=(--build-arg VERSION="${VERSION}")
 
 # update base image to get latest changes
 grep 'FROM.*/' package/Dockerfile | awk '{print $2}' | while read -r BASE_IMAGE

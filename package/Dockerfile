@@ -175,8 +175,10 @@ ENV CGO_CFLAGS="-I/usr/local/include" \
 WORKDIR /src
 COPY . /src
 
-RUN go mod vendor && \
-    go build -o /usr/local/bin/longhorn-instance-manager \
+# Build hermetically from the vendor/ tree copied in with the source — no
+# module downloads, so linkpoolio pseudo-version pins don't need to be
+# network-fetchable at image build time.
+RUN go build -mod=vendor -o /usr/local/bin/longhorn-instance-manager \
       -ldflags "-X main.Version=${VERSION}" \
       .
 

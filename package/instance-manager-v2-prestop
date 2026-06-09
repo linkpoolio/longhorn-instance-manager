@@ -5,7 +5,12 @@
 # stdout (/var/log/pods/<pod>/<ctr>/0.log). Redirect this script's output
 # to PID 1's fd 1 so the graceful-shutdown trace joins the container's
 # main log stream rather than being lost when the pod terminates.
-exec >> /proc/1/fd/1 2>&1
+# Guard the redirect: if PID 1's fd 1 isn't writable (e.g. unusual runtime
+# sandboxing), a failed exec would abort the whole script and skip the
+# graceful shutdown below — better to lose the logs than the drain.
+if [ -w /proc/1/fd/1 ]; then
+    exec >> /proc/1/fd/1 2>&1
+fi
 
 log() {
     echo "[prestop] $(date -u '+%Y-%m-%dT%H:%M:%S.%NZ') $*"
@@ -16,12 +21,18 @@ function cleanup_spdk_resources() {
 
     local v2_devices=($(get_v2_devices))
     for device in "${v2_devices[@]}"; do
-        dmsetup remove "$device"
-        log "Removed device-mapper device: $device"
+        if dmsetup remove "$device"; then
+            log "Removed device-mapper device: $device"
+        else
+            log "Failed to remove device-mapper device (possibly busy): $device"
+        fi
 
         device_file="/host/dev/longhorn/$device"
-        rm "$device_file"
-        log "Removed device file: $device_file"
+        if rm "$device_file"; then
+            log "Removed device file: $device_file"
+        else
+            log "Failed to remove device file: $device_file"
+        fi
     done
 
     # Drain NVMe-oF listeners BEFORE killing spdk_tgt. Removing each listener
@@ -67,8 +78,12 @@ function cleanup_spdk_resources() {
 }
 
 function get_v2_devices() {
+    # dmsetup ls prints "name<TAB>(major:minor)" per device, but emits the
+    # literal string "No devices found" on stdout when the table is empty —
+    # filter to lines whose second field looks like a "(maj:min)" entry so
+    # that string is never treated as a device name.
     local dm_devices
-    dm_devices=$(dmsetup ls 2>/dev/null | awk '{print $1}')
+    dm_devices=$(dmsetup ls 2>/dev/null | awk 'NF>1 && $2 ~ /^\(/ {print $1}')
     local v2_devices=()
 
     if [[ ! -d /host/dev/longhorn/ ]]; then
