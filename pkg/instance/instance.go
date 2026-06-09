@@ -443,6 +443,19 @@ func (ops V2DataEngineInstanceOps) InstanceList(instances map[string]*rpc.Instan
 		instances[engine.Name] = engineResponseToInstanceResponse(engine)
 	}
 
+	// Engine frontends are tracked as their own instance type. Without listing
+	// them here the manager's instance-manager monitor never populates
+	// InstanceManager.Status.InstanceEngineFrontends, so an EngineFrontend stays
+	// stuck in Starting (its instance is never observed Running) and the volume
+	// hangs in attaching even though the block device was created successfully.
+	engineFrontends, err := c.EngineFrontendList()
+	if err != nil {
+		return err
+	}
+	for _, engineFrontend := range engineFrontends {
+		instances[engineFrontend.Name] = engineFrontendResponseToInstanceResponse(engineFrontend)
+	}
+
 	return nil
 }
 
