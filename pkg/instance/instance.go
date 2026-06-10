@@ -915,6 +915,7 @@ func engineFrontendResponseToInstanceResponse(e *spdkapi.EngineFrontend) *rpc.In
 			Nqn:        path.NQN,
 			Nguid:      path.NGUID,
 			AnaState:   path.ANAState,
+			Transport:  path.Transport,
 		})
 	}
 

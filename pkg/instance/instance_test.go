@@ -35,6 +35,9 @@ func TestEngineFrontendResponseToInstanceResponse(t *testing.T) {
 		Endpoint:   "/dev/longhorn/pvc-test",
 		Frontend:   "spdk-tcp-blockdev",
 		State:      instanceStateRunning,
+		Paths: []*spdkapi.EngineFrontendNvmeTCPPath{
+			{TargetIP: "10.0.0.1", TargetPort: 20001, NQN: "nqn.test", ANAState: "optimized", Transport: "rdma"},
+		},
 	}
 
 	got := engineFrontendResponseToInstanceResponse(ef)
@@ -53,6 +56,15 @@ func TestEngineFrontendResponseToInstanceResponse(t *testing.T) {
 	}
 	if got.Status.Endpoint != ef.Endpoint {
 		t.Errorf("endpoint: got %q, want %q", got.Status.Endpoint, ef.Endpoint)
+	}
+	if len(got.Status.Paths) != 1 {
+		t.Fatalf("paths: got %d, want 1", len(got.Status.Paths))
+	}
+	if got.Status.Paths[0].Transport != "rdma" {
+		t.Errorf("path transport: got %q, want %q (manager publishes this on the EngineFrontend CRD)", got.Status.Paths[0].Transport, "rdma")
+	}
+	if got.Status.Paths[0].AnaState != "optimized" {
+		t.Errorf("path anaState: got %q, want %q", got.Status.Paths[0].AnaState, "optimized")
 	}
 }
 
