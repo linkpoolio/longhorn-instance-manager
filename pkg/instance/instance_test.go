@@ -174,3 +174,50 @@ func TestNewServer_WithoutTLS(t *testing.T) {
 		t.Error("V2 ops spdkTLSConfig should be nil when TLS is not provided")
 	}
 }
+
+// imrpcQosLimitsToSPDKRPC bridges two structurally identical generated
+// messages (imrpc.QosLimits on the manager → IM wire, spdkrpc.QosLimits on
+// the IM → spdk-engine wire). These tests pin the nil passthrough (no cap
+// configured must reach the engine as nil, not an all-zero message) and the
+// field-by-field mapping.
+func TestImrpcQosLimitsToSPDKRPCNil(t *testing.T) {
+	if got := imrpcQosLimitsToSPDKRPC(nil); got != nil {
+		t.Errorf("nil input: got %+v, want nil (engine treats nil as no cap)", got)
+	}
+}
+
+func TestImrpcQosLimitsToSPDKRPCFields(t *testing.T) {
+	in := &rpc.QosLimits{
+		RwIosPerSec: 1000,
+		RwMbPerSec:  200,
+		RMbPerSec:   150,
+		WMbPerSec:   100,
+	}
+
+	got := imrpcQosLimitsToSPDKRPC(in)
+	if got == nil {
+		t.Fatal("non-nil input: got nil")
+	}
+	if got.RwIosPerSec != in.RwIosPerSec {
+		t.Errorf("RwIosPerSec: got %d, want %d", got.RwIosPerSec, in.RwIosPerSec)
+	}
+	if got.RwMbPerSec != in.RwMbPerSec {
+		t.Errorf("RwMbPerSec: got %d, want %d", got.RwMbPerSec, in.RwMbPerSec)
+	}
+	if got.RMbPerSec != in.RMbPerSec {
+		t.Errorf("RMbPerSec: got %d, want %d", got.RMbPerSec, in.RMbPerSec)
+	}
+	if got.WMbPerSec != in.WMbPerSec {
+		t.Errorf("WMbPerSec: got %d, want %d", got.WMbPerSec, in.WMbPerSec)
+	}
+}
+
+func TestImrpcQosLimitsToSPDKRPCZeroValues(t *testing.T) {
+	got := imrpcQosLimitsToSPDKRPC(&rpc.QosLimits{})
+	if got == nil {
+		t.Fatal("all-zero input: got nil, want non-nil all-zero message (explicit unlimited)")
+	}
+	if got.RwIosPerSec != 0 || got.RwMbPerSec != 0 || got.RMbPerSec != 0 || got.WMbPerSec != 0 {
+		t.Errorf("all-zero input: got %+v, want all-zero fields", got)
+	}
+}
