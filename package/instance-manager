@@ -53,6 +53,15 @@ function enable_spdk_tgt() {
     # already holds CAP_SYS_RESOURCE, so prlimit on our own shell raises the
     # hard cap to unlimited; spdk_tgt inherits it.
     prlimit --pid $$ --memlock=unlimited:unlimited 2>/dev/null || true
+    # Crash forensics: spdk_tgt has died by unhandled signal with no output
+    # under mass TCP reconnect storms (suspected nvme_tcp teardown
+    # use-after-free). The node's kernel.core_pattern is the plain relative
+    # "core", so a dump lands in the process cwd -- launch from /log (the
+    # hostPath that survives pod replacement) instead of /, and pin the core
+    # rlimit so a backtrace is available the next time it dies. Hugepage
+    # ranges are excluded from dumps by the default coredump_filter, so the
+    # core stays heap+stacks sized.
+    prlimit --pid $$ --core=unlimited:unlimited 2>/dev/null || true
     # --wait-for-rpc keeps spdk_tgt paused before subsystem initialisation so
     # that the Go side can call iobuf_set_options / bdev_nvme_set_options /
     # nvmf_create_transport with tuned opts; then it drives framework_start_init
@@ -61,7 +70,7 @@ function enable_spdk_tgt() {
     # opts exceed the pool, failing accel/bdev channel creation with -ENOMEM.
     options+=("--wait-for-rpc")
     echo "Enabling spdk_tgt with options: ${options[*]}"
-    spdk_tgt "${options[@]}" 2>&1 | tee -a /log/spdk_tgt.log &
+    (cd /log && spdk_tgt "${options[@]}" 2>&1 | tee -a /log/spdk_tgt.log) &
 
     timeout=120  # Timeout in seconds
     interval=1  # Interval in seconds
