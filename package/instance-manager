@@ -90,9 +90,34 @@ function enable_spdk_tgt() {
     return 1
 }
 
+function watch_spdk_tgt() {
+    local instance_manager_pid="$1"
+
+    while kill -0 "$instance_manager_pid" >/dev/null 2>&1; do
+        if ! pgrep -f '(^|/)spdk_tgt([[:space:]]|$)' >/dev/null 2>&1; then
+            echo "spdk_tgt is not running; terminating longhorn-instance-manager"
+            kill -TERM "$instance_manager_pid" >/dev/null 2>&1 || true
+            sleep 10
+            kill -KILL "$instance_manager_pid" >/dev/null 2>&1 || true
+            return
+        fi
+        sleep 1
+    done
+}
+
+function forward_signal() {
+    local signal="$1"
+
+    if [[ -n "${instance_manager_pid:-}" ]] && kill -0 "$instance_manager_pid" >/dev/null 2>&1; then
+        echo "Forwarding $signal to longhorn-instance-manager"
+        kill "-$signal" "$instance_manager_pid" >/dev/null 2>&1 || true
+    fi
+}
+
 enable_spdk=0
 spdk_options=()
 instance_manager_options=()
+instance_manager_pid=""
 
 while [[ $# -gt 0 ]]; do
     opt="$1"
@@ -149,7 +174,20 @@ bind_lib_modules
 
 if [ "$enable_spdk" -eq 1 ]; then
     exec-logrotate
-    exec longhorn-instance-manager "${instance_manager_options[@]}" 2>&1 | tee -a /log/instance-manager-${DATA_ENGINE}.log
+    trap 'forward_signal TERM' TERM
+    trap 'forward_signal INT' INT
+
+    longhorn-instance-manager "${instance_manager_options[@]}" > >(tee -a /log/instance-manager-${DATA_ENGINE}.log) 2>&1 &
+    instance_manager_pid=$!
+    watch_spdk_tgt "$instance_manager_pid" &
+    spdk_watchdog_pid=$!
+
+    wait "$instance_manager_pid"
+    instance_manager_status=$?
+
+    kill "$spdk_watchdog_pid" >/dev/null 2>&1 || true
+    wait "$spdk_watchdog_pid" >/dev/null 2>&1 || true
+    exit "$instance_manager_status"
 else
     exec longhorn-instance-manager "${instance_manager_options[@]}"
 fi
