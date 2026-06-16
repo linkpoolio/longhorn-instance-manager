@@ -92,14 +92,16 @@ function enable_spdk_tgt() {
 
 function watch_spdk_tgt() {
     local instance_manager_pid="$1"
+    local spdk_watchdog_marker="$2"
 
     while kill -0 "$instance_manager_pid" >/dev/null 2>&1; do
         if ! pgrep -f '(^|/)spdk_tgt([[:space:]]|$)' >/dev/null 2>&1; then
-            echo "spdk_tgt is not running; terminating longhorn-instance-manager"
+            echo "spdk_tgt is not running; forcing instance-manager wrapper to exit"
+            touch "$spdk_watchdog_marker"
             kill -TERM "$instance_manager_pid" >/dev/null 2>&1 || true
-            sleep 10
+            sleep 2
             kill -KILL "$instance_manager_pid" >/dev/null 2>&1 || true
-            return
+            return 200
         fi
         sleep 1
     done
@@ -184,16 +186,33 @@ if [ "$enable_spdk" -eq 1 ]; then
 
     longhorn-instance-manager "${instance_manager_options[@]}" > "$log_fifo" 2>&1 &
     instance_manager_pid=$!
-    watch_spdk_tgt "$instance_manager_pid" &
+    spdk_watchdog_marker=$(mktemp -u /tmp/longhorn-spdk-watchdog.XXXXXX)
+    watch_spdk_tgt "$instance_manager_pid" "$spdk_watchdog_marker" &
     spdk_watchdog_pid=$!
 
-    wait "$instance_manager_pid"
-    instance_manager_status=$?
+    wait -n "$instance_manager_pid" "$spdk_watchdog_pid"
+    first_exit_status=$?
+
+    if [[ -f "$spdk_watchdog_marker" ]]; then
+        echo "SPDK watchdog fired; exiting instance-manager wrapper with failure"
+        kill -TERM "$instance_manager_pid" >/dev/null 2>&1 || true
+        sleep 1
+        kill -KILL "$instance_manager_pid" >/dev/null 2>&1 || true
+        kill "$log_tee_pid" >/dev/null 2>&1 || true
+        rm -f "$log_fifo" "$spdk_watchdog_marker"
+        exit 200
+    fi
 
     kill "$spdk_watchdog_pid" >/dev/null 2>&1 || true
     wait "$spdk_watchdog_pid" >/dev/null 2>&1 || true
+    instance_manager_status=$first_exit_status
+    wait "$instance_manager_pid" >/dev/null 2>&1
+    wait_status=$?
+    if [[ "$wait_status" -ne 127 ]]; then
+        instance_manager_status=$wait_status
+    fi
     wait "$log_tee_pid" >/dev/null 2>&1 || true
-    rm -f "$log_fifo"
+    rm -f "$log_fifo" "$spdk_watchdog_marker"
     exit "$instance_manager_status"
 else
     exec longhorn-instance-manager "${instance_manager_options[@]}"
