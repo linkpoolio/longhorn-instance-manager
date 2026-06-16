@@ -177,7 +177,12 @@ if [ "$enable_spdk" -eq 1 ]; then
     trap 'forward_signal TERM' TERM
     trap 'forward_signal INT' INT
 
-    longhorn-instance-manager "${instance_manager_options[@]}" > >(tee -a /log/instance-manager-${DATA_ENGINE}.log) 2>&1 &
+    log_fifo=$(mktemp -u /tmp/longhorn-instance-manager-log.XXXXXX)
+    mkfifo "$log_fifo"
+    tee -a /log/instance-manager-${DATA_ENGINE}.log < "$log_fifo" &
+    log_tee_pid=$!
+
+    longhorn-instance-manager "${instance_manager_options[@]}" > "$log_fifo" 2>&1 &
     instance_manager_pid=$!
     watch_spdk_tgt "$instance_manager_pid" &
     spdk_watchdog_pid=$!
@@ -187,6 +192,8 @@ if [ "$enable_spdk" -eq 1 ]; then
 
     kill "$spdk_watchdog_pid" >/dev/null 2>&1 || true
     wait "$spdk_watchdog_pid" >/dev/null 2>&1 || true
+    wait "$log_tee_pid" >/dev/null 2>&1 || true
+    rm -f "$log_fifo"
     exit "$instance_manager_status"
 else
     exec longhorn-instance-manager "${instance_manager_options[@]}"
