@@ -16,6 +16,63 @@ log() {
     echo "[prestop] $(date -u '+%Y-%m-%dT%H:%M:%S.%NZ') $*"
 }
 
+SPDK_TGT_PID_FILE="/var/run/longhorn-spdk-tgt.pid"
+
+process_is_running() {
+    local pid="$1"
+    local stat
+    local state
+
+    [[ -n "$pid" ]] || return 1
+    kill -0 "$pid" >/dev/null 2>&1 || return 1
+
+    stat=$(<"/proc/$pid/stat") || return 1
+    state="${stat#*) }"
+    state="${state%% *}"
+    [[ "$state" != "Z" ]]
+}
+
+process_argv0_is() {
+    local pid="$1"
+    local expected="$2"
+    local argv0
+
+    [[ -r "/proc/$pid/cmdline" ]] || return 1
+    IFS= read -r -d '' argv0 < "/proc/$pid/cmdline" || true
+    argv0="${argv0##*/}"
+    [[ "$argv0" == "$expected" ]]
+}
+
+spdk_tgt_pid_is_running() {
+    local pid="$1"
+
+    process_is_running "$pid" && process_argv0_is "$pid" "spdk_tgt"
+}
+
+get_spdk_tgt_pids() {
+    local pid
+    local proc
+
+    if [[ -r "$SPDK_TGT_PID_FILE" ]]; then
+        read -r pid < "$SPDK_TGT_PID_FILE" || true
+        if spdk_tgt_pid_is_running "$pid"; then
+            echo "$pid"
+            return
+        fi
+    fi
+
+    for proc in /proc/[0-9]*; do
+        pid="${proc##*/}"
+        if spdk_tgt_pid_is_running "$pid"; then
+            echo "$pid"
+        fi
+    done
+}
+
+spdk_tgt_is_running() {
+    [[ -n "$(get_spdk_tgt_pids)" ]]
+}
+
 function cleanup_spdk_resources() {
     log "Caught termination signal. Cleaning up SPDK resources..."
 
@@ -31,13 +88,11 @@ function cleanup_spdk_resources() {
     # to gracefully drain once spdk_tgt is gone, so return immediately and let
     # kubelet finish terminating the pod.
     #
-    # Liveness check uses `pgrep -f spdk_tgt` (full cmdline match), NOT
-    # `pidof spdk_tgt`: pidof is not installed in this image, and spdk_tgt
-    # renames its main thread to "reactor_0" so its /proc/<pid>/comm is
-    # "reactor_0" -- a comm-based match (pidof / pgrep -x spdk_tgt) misses a
-    # LIVE process and would make us always skip the drain. The argv[0]
-    # ("spdk_tgt -L all ...") still contains spdk_tgt, so -f matches reliably.
-    if ! pgrep -f spdk_tgt > /dev/null 2>&1; then
+    # Do not use `pgrep -f spdk_tgt`: the log tee command contains
+    # "/log/spdk_tgt.log" in its argv and can falsely look like a live SPDK
+    # process after spdk_tgt has crashed. Use the PID written by the wrapper,
+    # with an exact argv[0] fallback scan for older pods.
+    if ! spdk_tgt_is_running; then
         log "spdk_tgt is not running (already exited or crashed); nothing to drain, exiting prestop"
         return
     fi
@@ -95,10 +150,9 @@ function cleanup_spdk_resources() {
     # (15-30 min on a multi-TiB disk). Cleanly exiting here skips recovery
     # entirely. Cap at 270s: grace period is 300s, leaving 30s headroom.
     local deadline=$(( $(date +%s) + 270 ))
-    # pgrep -f (cmdline match), not pidof (absent) / comm match (thread is
-    # "reactor_0") -- see the liveness-check note above. With the broken pidof
-    # this loop exited immediately and never actually waited for the flush.
-    while pgrep -f spdk_tgt > /dev/null 2>&1; do
+    # Use the same exact process check as above. A log tee process must not keep
+    # PreStop waiting after the real spdk_tgt is gone.
+    while spdk_tgt_is_running; do
         if [[ $(date +%s) -ge ${deadline} ]]; then
             log "Timed out waiting for spdk_tgt to exit; blobstore may recover on next boot"
             return
