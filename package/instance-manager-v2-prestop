@@ -19,12 +19,38 @@ log() {
 function cleanup_spdk_resources() {
     log "Caught termination signal. Cleaning up SPDK resources..."
 
+    # If spdk_tgt is not running it has already exited or crashed. In that
+    # case the JSON-RPC socket is dead and any dm device still pointing at the
+    # vanished NVMe-oF target has stuck (uninterruptible D-state) I/O. Draining
+    # listeners over RPC or running `dmsetup remove` against those devices then
+    # BLOCKS FOREVER, so PreStop never returns: kubelet waits out the entire
+    # terminationGracePeriodSeconds, the wedged kernel I/O defeats the final
+    # SIGKILL too, and the pod is left stuck in Terminating — a zombie the
+    # instance-manager controller cannot reap, so a crashed spdk_tgt never gets
+    # its pod recreated (it has to be force-deleted by hand). There is nothing
+    # to gracefully drain once spdk_tgt is gone, so return immediately and let
+    # kubelet finish terminating the pod.
+    #
+    # Liveness check uses `pgrep -f spdk_tgt` (full cmdline match), NOT
+    # `pidof spdk_tgt`: pidof is not installed in this image, and spdk_tgt
+    # renames its main thread to "reactor_0" so its /proc/<pid>/comm is
+    # "reactor_0" -- a comm-based match (pidof / pgrep -x spdk_tgt) misses a
+    # LIVE process and would make us always skip the drain. The argv[0]
+    # ("spdk_tgt -L all ...") still contains spdk_tgt, so -f matches reliably.
+    if ! pgrep -f spdk_tgt > /dev/null 2>&1; then
+        log "spdk_tgt is not running (already exited or crashed); nothing to drain, exiting prestop"
+        return
+    fi
+
     local v2_devices=($(get_v2_devices))
     for device in "${v2_devices[@]}"; do
-        if dmsetup remove "$device"; then
+        # Bound dmsetup remove: a device still holding stuck I/O to a
+        # half-dead target can otherwise block forever and hang PreStop the
+        # same way a fully dead spdk_tgt would.
+        if timeout 10 dmsetup remove "$device"; then
             log "Removed device-mapper device: $device"
         else
-            log "Failed to remove device-mapper device (possibly busy): $device"
+            log "Failed to remove device-mapper device (busy or timed out): $device"
         fi
 
         device_file="/host/dev/longhorn/$device"
@@ -43,7 +69,9 @@ function cleanup_spdk_resources() {
     # and trip its own liveness probe. Best-effort: per-listener failures
     # don't block kill-instance.
     log "Draining NVMe-oF listeners so peer initiators see a clean disconnect..."
-    if go-spdk-helper nvme-of drain-listeners; then
+    # Bound the RPC: if spdk_tgt is alive but wedged (unresponsive reactor),
+    # the drain call can hang. A timeout keeps PreStop moving to the kill.
+    if timeout 30 go-spdk-helper nvme-of drain-listeners; then
         log "Drained NVMe-oF listeners successfully"
     else
         log "Failed to drain NVMe-oF listeners (continuing anyway)"
@@ -53,7 +81,7 @@ function cleanup_spdk_resources() {
     sleep 1
 
     log "Sending SIGTERM to go-spdk-helper to stop spdk_tgt..."
-    go-spdk-helper kill-instance --sig-name SIGTERM
+    timeout 30 go-spdk-helper kill-instance --sig-name SIGTERM
     if [[ $? -ne 0 ]]; then
         log "Failed to send SIGTERM to go-spdk-helper"
     else
@@ -67,7 +95,10 @@ function cleanup_spdk_resources() {
     # (15-30 min on a multi-TiB disk). Cleanly exiting here skips recovery
     # entirely. Cap at 270s: grace period is 300s, leaving 30s headroom.
     local deadline=$(( $(date +%s) + 270 ))
-    while pidof spdk_tgt > /dev/null 2>&1; do
+    # pgrep -f (cmdline match), not pidof (absent) / comm match (thread is
+    # "reactor_0") -- see the liveness-check note above. With the broken pidof
+    # this loop exited immediately and never actually waited for the flush.
+    while pgrep -f spdk_tgt > /dev/null 2>&1; do
         if [[ $(date +%s) -ge ${deadline} ]]; then
             log "Timed out waiting for spdk_tgt to exit; blobstore may recover on next boot"
             return
