@@ -70,13 +70,26 @@ function enable_spdk_tgt() {
     # opts exceed the pool, failing accel/bdev channel creation with -ENOMEM.
     options+=("--wait-for-rpc")
     echo "Enabling spdk_tgt with options: ${options[*]}"
-    (cd /log && spdk_tgt "${options[@]}" 2>&1 | tee -a /log/spdk_tgt.log) &
+    spdk_log_fifo=$(mktemp -u /tmp/longhorn-spdk-log.XXXXXX)
+    mkfifo "$spdk_log_fifo"
+    tee -a /log/spdk_tgt.log < "$spdk_log_fifo" &
+    spdk_log_tee_pid=$!
+    (
+        cd /log || exit 1
+        exec spdk_tgt "${options[@]}"
+    ) > "$spdk_log_fifo" 2>&1 &
+    spdk_tgt_pid=$!
 
     timeout=120  # Timeout in seconds
     interval=1  # Interval in seconds
     elapsed_time=0
 
     while [ $elapsed_time -lt $timeout ]; do
+        if ! process_is_running "$spdk_tgt_pid"; then
+            echo "spdk_tgt exited before socket file '/var/tmp/spdk.sock' was created."
+            return 1
+        fi
+
         if [ -S "/var/tmp/spdk.sock" ]; then
             echo "Socket file '/var/tmp/spdk.sock' found after $elapsed_time seconds."
             return 0  # Exit successfully if the file exists
@@ -90,21 +103,18 @@ function enable_spdk_tgt() {
     return 1
 }
 
-function watch_spdk_tgt() {
-    local instance_manager_pid="$1"
-    local spdk_watchdog_marker="$2"
+function process_is_running() {
+    local pid="$1"
+    local stat
+    local state
 
-    while kill -0 "$instance_manager_pid" >/dev/null 2>&1; do
-        if ! pgrep -f '(^|/)spdk_tgt([[:space:]]|$)' >/dev/null 2>&1; then
-            echo "spdk_tgt is not running; forcing instance-manager wrapper to exit"
-            touch "$spdk_watchdog_marker"
-            kill -TERM "$instance_manager_pid" >/dev/null 2>&1 || true
-            sleep 2
-            kill -KILL "$instance_manager_pid" >/dev/null 2>&1 || true
-            return 200
-        fi
-        sleep 1
-    done
+    [[ -n "$pid" ]] || return 1
+    kill -0 "$pid" >/dev/null 2>&1 || return 1
+
+    stat=$(<"/proc/$pid/stat") || return 1
+    state="${stat#*) }"
+    state="${state%% *}"
+    [[ "$state" != "Z" ]]
 }
 
 function forward_signal() {
@@ -116,10 +126,25 @@ function forward_signal() {
     fi
 }
 
+function cleanup_spdk_tgt() {
+    if process_is_running "${spdk_tgt_pid:-}"; then
+        kill -TERM "$spdk_tgt_pid" >/dev/null 2>&1 || true
+        sleep 1
+        kill -KILL "$spdk_tgt_pid" >/dev/null 2>&1 || true
+    fi
+    wait "${spdk_tgt_pid:-}" >/dev/null 2>&1 || true
+    kill "${spdk_log_tee_pid:-}" >/dev/null 2>&1 || true
+    wait "${spdk_log_tee_pid:-}" >/dev/null 2>&1 || true
+    rm -f "${spdk_log_fifo:-}"
+}
+
 enable_spdk=0
 spdk_options=()
 instance_manager_options=()
 instance_manager_pid=""
+spdk_tgt_pid=""
+spdk_log_fifo=""
+spdk_log_tee_pid=""
 
 while [[ $# -gt 0 ]]; do
     opt="$1"
@@ -186,33 +211,33 @@ if [ "$enable_spdk" -eq 1 ]; then
 
     longhorn-instance-manager "${instance_manager_options[@]}" > "$log_fifo" 2>&1 &
     instance_manager_pid=$!
-    spdk_watchdog_marker=$(mktemp -u /tmp/longhorn-spdk-watchdog.XXXXXX)
-    watch_spdk_tgt "$instance_manager_pid" "$spdk_watchdog_marker" &
-    spdk_watchdog_pid=$!
+    spdk_watchdog_fired=0
 
-    wait -n "$instance_manager_pid" "$spdk_watchdog_pid"
-    first_exit_status=$?
+    while process_is_running "$instance_manager_pid"; do
+        if ! process_is_running "$spdk_tgt_pid"; then
+            spdk_watchdog_fired=1
+            break
+        fi
+        sleep 1
+    done
 
-    if [[ -f "$spdk_watchdog_marker" ]]; then
+    if [[ "$spdk_watchdog_fired" -eq 1 ]]; then
+        echo "spdk_tgt is not running; forcing instance-manager wrapper to exit"
         echo "SPDK watchdog fired; exiting instance-manager wrapper with failure"
         kill -TERM "$instance_manager_pid" >/dev/null 2>&1 || true
         sleep 1
         kill -KILL "$instance_manager_pid" >/dev/null 2>&1 || true
         kill "$log_tee_pid" >/dev/null 2>&1 || true
-        rm -f "$log_fifo" "$spdk_watchdog_marker"
+        cleanup_spdk_tgt
+        rm -f "$log_fifo"
         exit 200
     fi
 
-    kill "$spdk_watchdog_pid" >/dev/null 2>&1 || true
-    wait "$spdk_watchdog_pid" >/dev/null 2>&1 || true
-    instance_manager_status=$first_exit_status
+    cleanup_spdk_tgt
     wait "$instance_manager_pid" >/dev/null 2>&1
-    wait_status=$?
-    if [[ "$wait_status" -ne 127 ]]; then
-        instance_manager_status=$wait_status
-    fi
+    instance_manager_status=$?
     wait "$log_tee_pid" >/dev/null 2>&1 || true
-    rm -f "$log_fifo" "$spdk_watchdog_marker"
+    rm -f "$log_fifo"
     exit "$instance_manager_status"
 else
     exec longhorn-instance-manager "${instance_manager_options[@]}"
