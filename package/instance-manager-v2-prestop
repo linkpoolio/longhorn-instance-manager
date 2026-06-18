@@ -1,34 +1,190 @@
 #!/bin/bash
 
+# kubelet runs PreStop as an exec against the container with its own
+# stdout/stderr — log shippers typically only tail the container's PID 1
+# stdout (/var/log/pods/<pod>/<ctr>/0.log). Redirect this script's output
+# to PID 1's fd 1 so the graceful-shutdown trace joins the container's
+# main log stream rather than being lost when the pod terminates.
+# Guard the redirect: if PID 1's fd 1 isn't writable (e.g. unusual runtime
+# sandboxing), a failed exec would abort the whole script and skip the
+# graceful shutdown below — better to lose the logs than the drain.
+if [ -w /proc/1/fd/1 ]; then
+    exec >> /proc/1/fd/1 2>&1
+fi
+
 log() {
-    echo "$(date '+%Y-%m-%d %H:%M:%S.%N') $*"
+    echo "[prestop] $(date -u '+%Y-%m-%dT%H:%M:%S.%NZ') $*"
+}
+
+SPDK_TGT_PID_FILE="/var/run/longhorn-spdk-tgt.pid"
+
+process_is_running() {
+    local pid="$1"
+    local stat
+    local state
+
+    [[ -n "$pid" ]] || return 1
+    kill -0 "$pid" >/dev/null 2>&1 || return 1
+
+    stat=$(<"/proc/$pid/stat") || return 1
+    state="${stat#*) }"
+    state="${state%% *}"
+    [[ "$state" != "Z" ]]
+}
+
+process_argv0_is() {
+    local pid="$1"
+    local expected="$2"
+    local argv0
+
+    [[ -r "/proc/$pid/cmdline" ]] || return 1
+    IFS= read -r -d '' argv0 < "/proc/$pid/cmdline" || true
+    argv0="${argv0##*/}"
+    [[ "$argv0" == "$expected" ]]
+}
+
+spdk_tgt_pid_is_running() {
+    local pid="$1"
+
+    process_is_running "$pid" && process_argv0_is "$pid" "spdk_tgt"
+}
+
+get_spdk_tgt_pids() {
+    local pid
+    local proc
+
+    if [[ -r "$SPDK_TGT_PID_FILE" ]]; then
+        read -r pid < "$SPDK_TGT_PID_FILE" || true
+        if spdk_tgt_pid_is_running "$pid"; then
+            echo "$pid"
+            return
+        fi
+    fi
+
+    for proc in /proc/[0-9]*; do
+        pid="${proc##*/}"
+        if spdk_tgt_pid_is_running "$pid"; then
+            echo "$pid"
+        fi
+    done
+}
+
+spdk_tgt_is_running() {
+    [[ -n "$(get_spdk_tgt_pids)" ]]
 }
 
 function cleanup_spdk_resources() {
     log "Caught termination signal. Cleaning up SPDK resources..."
 
+    # Do not use `pgrep -f spdk_tgt`: the log tee command contains
+    # "/log/spdk_tgt.log" in its argv and can falsely look like a live SPDK
+    # process after spdk_tgt has crashed. Use the PID written by the wrapper,
+    # with an exact argv[0] fallback scan for older pods.
+    if ! spdk_tgt_is_running; then
+        # spdk_tgt has already exited or crashed. Its NVMe-oF target is gone,
+        # so any dm device still mapping a /dev/longhorn volume onto that target
+        # has in-flight I/O parked in uninterruptible D-state. That wedged
+        # kernel I/O defeats the container's final SIGKILL, so the pod hangs in
+        # Terminating forever -- an un-reapable zombie the instance-manager
+        # controller cannot recreate, which is why a crashed spdk_tgt used to
+        # need a manual `kubectl delete --force`. Any workload still mounted on
+        # those devices stays blocked in D-state too.
+        #
+        # We cannot drain gracefully (the JSON-RPC socket died with spdk_tgt),
+        # and a plain `dmsetup remove` would itself block forever here: it
+        # suspends+flushes, waiting on the very I/O that can never complete.
+        # `dmsetup remove --force` instead swaps in the dm "error" target, which
+        # fails all outstanding and future I/O with EIO immediately -- releasing
+        # the D-state waiters so the device can be torn down, the container
+        # reaped, and the pod recreated with a fresh spdk_tgt. The workload sees
+        # I/O errors (recoverable when the volume reattaches) instead of an
+        # unbounded hang. Bound each call so a single uncooperative device can't
+        # re-hang PreStop.
+        log "spdk_tgt is not running (crashed/exited); force-failing stale dm devices so stuck I/O is released and the pod can be reaped"
+        local dead_devices=($(get_v2_devices))
+        for device in "${dead_devices[@]}"; do
+            if timeout 10 dmsetup remove --force "$device"; then
+                log "Force-removed stale device-mapper device: $device"
+            else
+                log "Failed to force-remove device-mapper device (relying on SIGKILL): $device"
+            fi
+            rm -f "/host/dev/longhorn/$device"
+        done
+        return
+    fi
+
     local v2_devices=($(get_v2_devices))
     for device in "${v2_devices[@]}"; do
-        dmsetup remove "$device"
-        log "Removed device-mapper device: $device"
+        # Bound dmsetup remove: a device still holding stuck I/O to a
+        # half-dead target can otherwise block forever and hang PreStop the
+        # same way a fully dead spdk_tgt would.
+        if timeout 10 dmsetup remove "$device"; then
+            log "Removed device-mapper device: $device"
+        else
+            log "Failed to remove device-mapper device (busy or timed out): $device"
+        fi
 
         device_file="/host/dev/longhorn/$device"
-        rm "$device_file"
-        log "Removed device file: $device_file"
+        if rm "$device_file"; then
+            log "Removed device file: $device_file"
+        else
+            log "Failed to remove device file: $device_file"
+        fi
     done
 
+    # Drain NVMe-oF listeners BEFORE killing spdk_tgt. Removing each listener
+    # tells SPDK to send a clean RDMA/TCP disconnect frame to every connected
+    # initiator. Without this, peer bdev_nvme controllers see only an
+    # ungraceful transport drop and wedge in "failover already in progress"
+    # for ctrlr_loss_timeout, which on the peer side can starve its reactor
+    # and trip its own liveness probe. Best-effort: per-listener failures
+    # don't block kill-instance.
+    log "Draining NVMe-oF listeners so peer initiators see a clean disconnect..."
+    # Bound the RPC: if spdk_tgt is alive but wedged (unresponsive reactor),
+    # the drain call can hang. A timeout keeps PreStop moving to the kill.
+    if timeout 30 go-spdk-helper nvme-of drain-listeners; then
+        log "Drained NVMe-oF listeners successfully"
+    else
+        log "Failed to drain NVMe-oF listeners (continuing anyway)"
+    fi
+    # Brief settle so the NIC can flush the disconnect frames before the
+    # transport tears down with spdk_tgt's exit.
+    sleep 1
+
     log "Sending SIGTERM to go-spdk-helper to stop spdk_tgt..."
-    go-spdk-helper kill-instance --sig-name SIGTERM
+    timeout 30 go-spdk-helper kill-instance --sig-name SIGTERM
     if [[ $? -ne 0 ]]; then
         log "Failed to send SIGTERM to go-spdk-helper"
     else
         log "Successfully sent SIGTERM to go-spdk-helper"
     fi
+
+    # Wait for spdk_tgt to fully exit before returning. Without this, kubelet's
+    # terminationGracePeriodSeconds clock can expire while SPDK is still
+    # flushing its blobstore, forcing SIGKILL mid-flush. That leaves the
+    # on-disk dirty bit set and the next boot runs a full blobstore recovery
+    # (15-30 min on a multi-TiB disk). Cleanly exiting here skips recovery
+    # entirely. Cap at 270s: grace period is 300s, leaving 30s headroom.
+    local deadline=$(( $(date +%s) + 270 ))
+    # Use the same exact process check as above. A log tee process must not keep
+    # PreStop waiting after the real spdk_tgt is gone.
+    while spdk_tgt_is_running; do
+        if [[ $(date +%s) -ge ${deadline} ]]; then
+            log "Timed out waiting for spdk_tgt to exit; blobstore may recover on next boot"
+            return
+        fi
+        sleep 1
+    done
+    log "spdk_tgt exited cleanly after SIGTERM"
 }
 
 function get_v2_devices() {
+    # dmsetup ls prints "name<TAB>(major:minor)" per device, but emits the
+    # literal string "No devices found" on stdout when the table is empty —
+    # filter to lines whose second field looks like a "(maj:min)" entry so
+    # that string is never treated as a device name.
     local dm_devices
-    dm_devices=$(dmsetup ls 2>/dev/null | awk '{print $1}')
+    dm_devices=$(dmsetup ls 2>/dev/null | awk 'NF>1 && $2 ~ /^\(/ {print $1}')
     local v2_devices=()
 
     if [[ ! -d /host/dev/longhorn/ ]]; then

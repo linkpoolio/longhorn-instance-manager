@@ -1,6 +1,7 @@
 package spdk
 
 import (
+	"context"
 	"fmt"
 	"net"
 	"strconv"
@@ -21,6 +22,8 @@ import (
 	"github.com/longhorn/go-spdk-helper/pkg/jsonrpc"
 	"github.com/longhorn/types/pkg/generated/spdkrpc"
 
+	btypes "github.com/longhorn/backupstore/types"
+	butil "github.com/longhorn/backupstore/util"
 	commonbitmap "github.com/longhorn/go-common-libs/bitmap"
 	commonnet "github.com/longhorn/go-common-libs/net"
 	commonutils "github.com/longhorn/go-common-libs/utils"
@@ -41,9 +44,22 @@ type NvmeTcpTarget struct {
 	IP   string
 	Port int32
 
-	Nqn      string
-	Nguid    string
-	ANAState NvmeTCPANAState
+	Nqn       string
+	Nguid     string
+	ANAState  NvmeTCPANAState
+	Transport NvmfTransportType
+}
+
+// engineFrontendTargetTransport is the transport of the engine's
+// frontend-facing NVMe-oF target listener. Pinned to TCP: the engine target
+// serves the host-side kernel NVMe initiator, which connects over nvme-tcp
+// (see createNVMeTCPTarget for the full rationale). EngineFrontend path
+// tagging derives from this same function so the EF never tags a path RDMA
+// while the target it actually dials listens on TCP — a mistagged path would
+// make the switchover RDMA teardown force-disconnect a TCP controller that
+// must instead be left to ctrl-loss-tmo for ANA rollback.
+func engineFrontendTargetTransport() NvmfTransportType {
+	return NvmfTransportTCP
 }
 
 func toSPDKListenerANAState(anaState NvmeTCPANAState) (spdktypes.NvmfSubsystemListenerAnaState, error) {
@@ -110,12 +126,26 @@ func (m *MockReplicaAdder) ReplicaAddFinish(srcReplicaServiceCli, dstReplicaServ
 type Engine struct {
 	sync.RWMutex
 
+	ctx       context.Context
+	cancelCtx context.CancelFunc
+
+	restore *EngineRestore
+
 	Name       string
 	VolumeName string
 	SpecSize   uint64
 	ActualSize uint64
 	Frontend   string
-	Endpoint   string
+
+	// ReplicaTransport is this engine node's NVMe-oF transport (TCP or RDMA),
+	// derived from the IM's node transport. It selects which replica listener
+	// the engine dials and which transport its own target exposes.
+	ReplicaTransport NvmfTransportType
+
+	// QosLimits caps aggregate raid bdev I/O. Applied at Create time and
+	// re-applied on observer-driven reconstruct. Live updates go through
+	// the EngineSetQosLimit gRPC handler.
+	QosLimits QosLimits
 
 	ctrlrLossTimeout     int
 	fastIOFailTimeoutSec int
@@ -125,11 +155,36 @@ type Engine struct {
 
 	NvmeTcpTarget *NvmeTcpTarget
 
+	// metadataDir, when non-empty, enables on-disk persistence of engine state
+	// to <metadataDir>/engines/<name>/engine.json. Mirrors the pattern in
+	// replica.go and enginefrontend.go; the server wires this at engine
+	// construction time. Recovery uses loadEngineRecords + restoreFromRecord.
+	metadataDir string
+
+	// deltaBitmapEnabled toggles SPDK raid1's per-base-bdev dirty-region
+	// tracking. When true, a base bdev that disconnects retains its bitmap
+	// of dirty regions and on reconnect only those regions need re-copying
+	// instead of a full resync. Set at engine construction; callers that
+	// re-create the raid (snapshot revert, backup restore, reconstruct)
+	// must pass the same value to keep the flag stable across a volume's
+	// lifetime. Default true; can be forced off via LONGHORN_V2_RAID_DELTA_BITMAP=0
+	// if the base bdev layer doesn't report optimal_io_boundary.
+	deltaBitmapEnabled bool
+
+	// ReplicaDirtyBitmaps maps replica name → last-captured dirty bitmap
+	// from the moment the replica transitioned to ERR. Used on reconnect
+	// to drive incremental (shallow-copy-only-the-dirty-regions) rebuild
+	// instead of full resync. Entries are cleared once the replica
+	// returns to RW. Survives IM restart via EngineRecord.
+	ReplicaDirtyBitmaps map[string]*ReplicaDirtyBitmap
+
 	State    types.InstanceState
 	ErrorMsg string
 
 	Head        *api.Lvol
 	SnapshotMap map[string]*api.Lvol
+
+	SnapshotMaxCount int32
 
 	IsRestoring           bool
 	RestoringSnapshotName string
@@ -162,12 +217,75 @@ type Engine struct {
 }
 
 type EngineReplicaStatus struct {
-	Address  string
-	BdevName string
-	Mode     types.Mode
+	// Address is the canonical NVMe-oF address for this replica as supplied
+	// by the manager in spec.replicaAddressMap (the replica's primary
+	// listener). This is what we report back to the manager so its
+	// reconciler can match replicas by address. For the address the engine
+	// actually dialed — which may differ when we pick the TCP fallback
+	// listener because our node transport doesn't match the replica's
+	// primary — see DialedAddress.
+	Address string
+	// DialedAddress is the NVMe-oF address the engine's bdev_nvme
+	// controller is actually attached to. Equal to Address when the engine
+	// and replica transports match; equal to the replica's tcpAddress (on
+	// port+1) when the engine fell back to TCP against an RDMA-primary
+	// replica listener. Reconnect/attach paths must dial this, not Address.
+	DialedAddress string
+	BdevName      string
+	Mode          types.Mode
+	// Transport is the NVMe-oF transport this replica's bdev_nvme controller
+	// was attached over (TCP or RDMA) — i.e. the transport of DialedAddress.
+	Transport NvmfTransportType
+	// validationFailures counts consecutive ValidateAndUpdate NVMe-validation
+	// failures for a currently-RW (healthy) replica. A healthy replica is only
+	// downgraded to ERR after maxReplicaValidationFailures consecutive failures,
+	// so a single transient glitch — e.g. the shared SPDK socket briefly busy
+	// while a sibling rebuild replica tears down — cannot fault a healthy
+	// replica (and, when it is the volume's only healthy copy, the whole
+	// volume). Reset to 0 on any successful validation. Not persisted
+	// (transient; resets to 0 on engine-record restore).
+	validationFailures int
 }
 
-func NewEngine(engineName, volumeName, frontend string, specSize uint64, engineUpdateCh chan interface{}) *Engine {
+// transportOrDefault returns the per-replica Transport if set, otherwise the
+// supplied default (typically the engine's replicaTransport). Lets reconnect
+// paths handle older persisted records written before the field existed.
+func (s *EngineReplicaStatus) transportOrDefault(def NvmfTransportType) NvmfTransportType {
+	if s == nil || s.Transport == "" {
+		return def
+	}
+	return s.Transport
+}
+
+// dialAddress is the address reconnect/rebuild paths must dial: the address
+// actually attached (DialedAddress), falling back to the canonical Address for
+// records written before dual-listener (DialedAddress empty).
+func (s *EngineReplicaStatus) dialAddress() string {
+	if s == nil {
+		return ""
+	}
+	if s.DialedAddress != "" {
+		return s.DialedAddress
+	}
+	return s.Address
+}
+
+// QosLimits caps aggregate raid bdev I/O via SPDK bdev_set_qos_limit.
+type QosLimits struct {
+	RwIOsPerSec int64 `json:"rwIOsPerSec,omitempty"`
+	RwMBPerSec  int64 `json:"rwMBPerSec,omitempty"`
+	RMBPerSec   int64 `json:"rMBPerSec,omitempty"`
+	WMBPerSec   int64 `json:"wMBPerSec,omitempty"`
+}
+
+// IsZero reports whether the QoS struct has any non-default value. Used to
+// skip the SPDK call entirely when no limits are configured (the default
+// no-op state — most volumes won't have QoS set).
+func (q QosLimits) IsZero() bool {
+	return q.RwIOsPerSec == 0 && q.RwMBPerSec == 0 && q.RMBPerSec == 0 && q.WMBPerSec == 0
+}
+
+func NewEngine(engineName, volumeName, frontend string, specSize uint64, replicaTransport NvmfTransportType, engineUpdateCh chan interface{}, snapshotMaxCount int32) *Engine {
 	log := logrus.StandardLogger().WithFields(logrus.Fields{
 		"engineName": engineName,
 		"volumeName": volumeName,
@@ -179,11 +297,20 @@ func NewEngine(engineName, volumeName, frontend string, specSize uint64, engineU
 	}
 	log.WithField("specSize", roundedSpecSize)
 
+	ctx, cancelCtx := context.WithCancel(context.Background())
+
 	e := &Engine{
+		ctx:       ctx,
+		cancelCtx: cancelCtx,
+
 		Name:       engineName,
 		VolumeName: volumeName,
 		Frontend:   frontend,
 		SpecSize:   specSize,
+
+		ReplicaTransport: replicaTransport,
+
+		deltaBitmapEnabled: defaultRaidDeltaBitmapEnabled(),
 
 		// TODO: support user-defined values
 		ctrlrLossTimeout:     replicaCtrlrLossTimeoutSec,
@@ -195,6 +322,8 @@ func NewEngine(engineName, volumeName, frontend string, specSize uint64, engineU
 
 		State: types.InstanceStatePending,
 
+		SnapshotMaxCount: snapshotMaxCount,
+
 		SnapshotMap: map[string]*api.Lvol{},
 
 		UpdateCh: engineUpdateCh,
@@ -205,7 +334,7 @@ func NewEngine(engineName, volumeName, frontend string, specSize uint64, engineU
 	return e
 }
 
-func (e *Engine) Create(spdkClient *spdkclient.Client, replicaAddressMap map[string]string, portCount int32, superiorPortAllocator *commonbitmap.Bitmap,
+func (e *Engine) Create(spdkClient *spdkclient.Client, replicaAddressMap map[string]string, replicaTransportAddressMap map[string]*spdkrpc.ReplicaTransportAddresses, portCount int32, superiorPortAllocator *commonbitmap.Bitmap,
 	salvageRequested bool) (ret *spdkrpc.Engine, err error) {
 	e.log.WithFields(logrus.Fields{
 		"portCount":         portCount,
@@ -262,7 +391,7 @@ func (e *Engine) Create(spdkClient *spdkclient.Client, replicaAddressMap map[str
 		}
 	}
 
-	replicaBdevList := e.connectReplicas(spdkClient, replicaAddressMap)
+	replicaBdevList := e.connectReplicas(spdkClient, replicaAddressMap, replicaTransportAddressMap)
 
 	e.log.UpdateLoggerWithWarnOnFailure(logrus.Fields{
 		"replicaStatusMap": e.ReplicaStatusMap,
@@ -271,8 +400,24 @@ func (e *Engine) Create(spdkClient *spdkclient.Client, replicaAddressMap map[str
 	e.checkAndUpdateInfoFromReplicasNoLock()
 
 	e.log.Infof("Connected all available replicas %+v, then launching raid during engine creation", e.ReplicaStatusMap)
-	if _, err := spdkClient.BdevRaidCreate(e.Name, spdktypes.BdevRaidLevel1, 0, replicaBdevList, ""); err != nil {
+	if _, err := spdkClient.BdevRaidCreate(e.Name, spdktypes.BdevRaidLevel1, 0, replicaBdevList, "", e.deltaBitmapEnabled); err != nil {
 		return nil, err
+	}
+
+	// Apply per-volume QoS to the raid bdev. SPDK enforces the four limits
+	// as separate token buckets; rebuild traffic bypasses this cap because
+	// it goes engine→replica directly via NVMe-oF rather than through the
+	// raid bdev.
+	if !e.QosLimits.IsZero() {
+		if err := spdkClient.BdevSetQosLimit(e.Name,
+			e.QosLimits.RwIOsPerSec,
+			e.QosLimits.RwMBPerSec,
+			e.QosLimits.RMBPerSec,
+			e.QosLimits.WMBPerSec); err != nil {
+			return nil, errors.Wrapf(err, "failed to apply QoS limits to raid bdev for engine %v", e.Name)
+		}
+		e.log.Infof("Applied QoS limits to raid bdev: rwIOPS=%d rwMBps=%d rMBps=%d wMBps=%d",
+			e.QosLimits.RwIOsPerSec, e.QosLimits.RwMBPerSec, e.QosLimits.RMBPerSec, e.QosLimits.WMBPerSec)
 	}
 
 	switch e.Frontend {
@@ -289,6 +434,10 @@ func (e *Engine) Create(spdkClient *spdkclient.Client, replicaAddressMap map[str
 	}
 
 	e.State = types.InstanceStateRunning
+
+	if saveErr := saveEngineRecord(e.metadataDir, e); saveErr != nil {
+		e.log.WithError(saveErr).Warnf("Failed to persist engine record for %s after create", e.Name)
+	}
 
 	e.log.Info("Created engine target")
 
@@ -317,6 +466,14 @@ func (e *Engine) createNVMeTCPTarget(spdkClient *spdkclient.Client, superiorPort
 	e.NvmeTcpTarget.Port = port
 	e.NvmeTcpTarget.Nqn = getStableVolumeNQN(e.VolumeName)
 	e.NvmeTcpTarget.Nguid = getStableVolumeNGUID(e.VolumeName)
+	// Engine target serves the host-side kernel NVMe initiator (spdk-tcp-blockdev
+	// frontend), which is always TCP. Keeping this on TCP regardless of the
+	// replica<->engine transport avoids the dual-listener split-port problem:
+	// the kernel has no way to reach an RDMA-only engine listener, and the
+	// separately-allocated "TCP fallback" port never matches the address the
+	// frontend connects to. replicaTransport() still controls RDMA for the
+	// inter-SPDK replica attach, which is where the bandwidth benefit lives.
+	e.NvmeTcpTarget.Transport = engineFrontendTargetTransport()
 
 	spdkANAState, err := toSPDKListenerANAState(initialANAState)
 	if err != nil {
@@ -328,13 +485,13 @@ func (e *Engine) createNVMeTCPTarget(spdkClient *spdkclient.Client, superiorPort
 		return errors.Wrapf(err, "failed to blindly stop exposing RAID bdev for engine target %v", e.Name)
 	}
 
-	cntlid := getEngineCntlid(e.Name)
+	minCntlid, maxCntlid := e.resolveCntlidRange()
 	nsUUID := getStableVolumeNsUUID(e.VolumeName)
 
-	e.log.Infof("Starting to expose RAID bdev for engine target %v on %v:%v with initial ANA state %v, cntlid %v, nsUUID %v",
-		e.Name, e.NvmeTcpTarget.IP, e.NvmeTcpTarget.Port, initialANAState, cntlid, nsUUID)
+	e.log.Infof("Starting to expose RAID bdev for engine target %v on %v:%v with initial ANA state %v, cntlid [%v,%v], nsUUID %v",
+		e.Name, e.NvmeTcpTarget.IP, e.NvmeTcpTarget.Port, initialANAState, minCntlid, maxCntlid, nsUUID)
 	if err := spdkClient.StartExposeBdevWithANAState(e.NvmeTcpTarget.Nqn, e.Name, e.NvmeTcpTarget.Nguid, nsUUID,
-		e.NvmeTcpTarget.IP, strconv.Itoa(int(e.NvmeTcpTarget.Port)), spdkANAState, cntlid, cntlid); err != nil {
+		e.NvmeTcpTarget.IP, strconv.Itoa(int(e.NvmeTcpTarget.Port)), spdkANAState, minCntlid, maxCntlid); err != nil {
 		// No need to release ports here. The engine will be marked as ERR by
 		// Create's deferred error handler, and Delete will release the ports
 		// when the user cleans up this engine.
@@ -348,21 +505,211 @@ func (e *Engine) createNVMeTCPTarget(spdkClient *spdkclient.Client, superiorPort
 
 // connectReplicas connects to each replica's NVMf bdev and populates
 // ReplicaStatusMap. It returns the list of successfully connected bdev names.
-func (e *Engine) connectReplicas(spdkClient *spdkclient.Client, replicaAddressMap map[string]string) []string {
+// replicaTransport is the NVMe-oF transport this engine dials replicas over,
+// falling back to the default when unset (older records / v1 paths).
+func (e *Engine) replicaTransport() NvmfTransportType {
+	if e.ReplicaTransport == "" {
+		return DefaultNvmfTransport
+	}
+	return e.ReplicaTransport
+}
+
+// targetTransport is the transport this engine's own NVMe-oF target exposes.
+func (e *Engine) targetTransport() NvmfTransportType {
+	if e.NvmeTcpTarget == nil || e.NvmeTcpTarget.Transport == "" {
+		return DefaultNvmfTransport
+	}
+	return e.NvmeTcpTarget.Transport
+}
+
+// RemoveTargetListener removes this engine's NVMe-oF target listener for the
+// given transport. During a switchover the old RDMA path's HCA queue pair stays
+// pinned in the device's QP table until both the initiator disconnects and the
+// target releases its listener; setting the path ANA-inaccessible does not free
+// it. This is called on the old target to release that resource. TCP listeners
+// are left to ctrl-loss-tmo so a passed-in transport of "" falls back to the
+// engine's own target transport.
+func (e *Engine) RemoveTargetListener(spdkClient *spdkclient.Client, transport NvmfTransportType) error {
+	if e == nil {
+		return fmt.Errorf("engine is nil")
+	}
+	if spdkClient == nil {
+		return fmt.Errorf("SPDK client is nil for engine %s", e.Name)
+	}
+
+	e.Lock()
+	defer e.Unlock()
+
+	if e.NvmeTcpTarget == nil {
+		return nil
+	}
+
+	nqn := e.NvmeTcpTarget.Nqn
+	ip := e.NvmeTcpTarget.IP
+	port := e.NvmeTcpTarget.Port
+	if nqn == "" || ip == "" || port == 0 {
+		return nil
+	}
+
+	if transport == "" {
+		transport = e.targetTransport()
+	}
+
+	_, err := spdkClient.NvmfSubsystemRemoveListener(
+		nqn, ip, strconv.Itoa(int(port)),
+		transport.ToSPDKTransportType(),
+		spdktypes.NvmeAddressFamilyIPv4,
+	)
+	if err != nil {
+		return errors.Wrapf(err, "failed to remove %s target listener for engine %s", transport, e.Name)
+	}
+	e.log.WithFields(logrus.Fields{
+		"targetIP":   ip,
+		"targetPort": port,
+		"transport":  transport,
+	}).Info("Removed engine target listener")
+	return nil
+}
+
+// resolveCntlidRange returns the cntlid [min, max] range for this engine's
+// subsystem. Every engine generation gets a large, disjoint window so that
+// (a) initiator reconnect churn can never exhaust the subsystem's controller
+// slots, and (b) the two consecutive-ordinal targets that briefly share an NQN
+// during a live migration / engine upgrade never collide. A single range
+// covers both an RDMA engine's RDMA and TCP-fallback listeners (same
+// subsystem). See getEngineCntlidRange for the allocation scheme.
+func (e *Engine) resolveCntlidRange() (uint16, uint16) {
+	return getEngineCntlidRange(e.Name)
+}
+
+// SetQosLimit applies a new QoS configuration to the engine's raid bdev
+// at runtime. Used for changing the cap on an attached volume without
+// re-creating it. Persists the new limits to the engine record so a
+// subsequent IM restart re-applies them on raid reconstruction.
+//
+// limits.IsZero() is the legitimate "remove the cap" state — passes
+// zeros to SPDK which sets every bucket to unlimited.
+func (e *Engine) SetQosLimit(spdkClient *spdkclient.Client, limits QosLimits) error {
+	e.Lock()
+	defer e.Unlock()
+
+	if e.State != types.InstanceStateRunning {
+		return fmt.Errorf("engine %s state %s is not running, refusing to set QoS", e.Name, e.State)
+	}
+
+	if err := spdkClient.BdevSetQosLimit(e.Name,
+		limits.RwIOsPerSec,
+		limits.RwMBPerSec,
+		limits.RMBPerSec,
+		limits.WMBPerSec); err != nil {
+		return errors.Wrapf(err, "failed to set QoS limits on raid bdev for engine %v", e.Name)
+	}
+
+	e.QosLimits = limits
+	if saveErr := saveEngineRecord(e.metadataDir, e); saveErr != nil {
+		e.log.WithError(saveErr).Warn("Failed to persist engine record after QoS update; new limits in effect but won't survive restart")
+	}
+	e.log.Infof("Updated QoS limits: rwIOPS=%d rwMBps=%d rMBps=%d wMBps=%d",
+		limits.RwIOsPerSec, limits.RwMBPerSec, limits.RMBPerSec, limits.WMBPerSec)
+	return nil
+}
+
+// pickReplicaAddress selects the address + transport to dial for a replica.
+// When the transport-aware map carries an entry for the replica (a storage IM
+// that reports its typed TCP/RDMA ports) it is the source of truth. When it
+// does not -- a transport-unaware/older storage IM that reports only the
+// legacy primary port -- we fall back to the addressing convention via
+// legacyTransportFallback, which keeps a rebased engine backward-compatible
+// with storage IMs that predate typed-port reporting (no storage roll needed).
+//
+// The returned legacyConvention flag reports whether the address was derived
+// from the legacy convention (true) or taken from the transport map (false).
+// Only legacy-convention dials may use the runtime TCP fallback at primary+1
+// (see shouldAttemptLegacyTCPFallback).
+func (e *Engine) pickReplicaAddress(replicaName, legacyAddress string, replicaTransportAddressMap map[string]*spdkrpc.ReplicaTransportAddresses) (string, NvmfTransportType, bool) {
+	tAddrs, ok := replicaTransportAddressMap[replicaName]
+	if !ok || tAddrs == nil {
+		return e.legacyTransportFallback(legacyAddress)
+	}
+	return e.pickFromTransportAddresses(legacyAddress, tAddrs)
+}
+
+// pickRebuildDstAddress applies the same selection rule to a rebuild
+// destination's transport addresses.
+func (e *Engine) pickRebuildDstAddress(legacyAddress string, tAddrs *spdkrpc.ReplicaTransportAddresses) (string, NvmfTransportType, bool) {
+	return e.pickFromTransportAddresses(legacyAddress, tAddrs)
+}
+
+// pickFromTransportAddresses is the shared selection rule when the replica
+// advertises typed transport addresses: prefer the RDMA address when this
+// engine is RDMA-capable and the replica advertises one; otherwise the
+// replica's advertised TCP address; otherwise fall back to the convention.
+func (e *Engine) pickFromTransportAddresses(legacyAddress string, tAddrs *spdkrpc.ReplicaTransportAddresses) (string, NvmfTransportType, bool) {
+	if tAddrs == nil {
+		return e.legacyTransportFallback(legacyAddress)
+	}
+	if e.replicaTransport().IsRDMA() && tAddrs.RdmaAddress != "" {
+		return tAddrs.RdmaAddress, NvmfTransportRDMA, false
+	}
+	if tAddrs.TcpAddress != "" {
+		return tAddrs.TcpAddress, NvmfTransportTCP, false
+	}
+	return e.legacyTransportFallback(legacyAddress)
+}
+
+// legacyTransportFallback derives the address+transport to dial when a replica
+// advertises no usable transport-address map entry, i.e. its storage IM does
+// not report typed TCP/RDMA ports. It mirrors the storage exposure convention
+// (Replica.listenerPortsForTransport / addTCPFallbackListener) and the
+// pre-rebase engine behaviour:
+//
+//   - the legacy address is the replica's primary listener port;
+//   - on an RDMA storage node that primary is the RDMA listener, with a TCP
+//     fallback exposed at primary+1.
+//
+// So an RDMA engine dials the legacy (RDMA primary) address over RDMA, and a
+// TCP engine dials primary+1 over TCP. This keeps a rebased engine connecting
+// to an older, transport-unaware storage IM without a storage roll. If the
+// address can't be parsed, dial it as-is over TCP as a last resort.
+func (e *Engine) legacyTransportFallback(legacyAddress string) (string, NvmfTransportType, bool) {
+	if e.replicaTransport().IsRDMA() {
+		return legacyAddress, NvmfTransportRDMA, true
+	}
+	host, portStr, err := net.SplitHostPort(legacyAddress)
+	if err != nil {
+		return legacyAddress, NvmfTransportTCP, true
+	}
+	port, err := strconv.Atoi(portStr)
+	if err != nil {
+		return legacyAddress, NvmfTransportTCP, true
+	}
+	return net.JoinHostPort(host, strconv.Itoa(int(tcpFallbackPortFor(int32(port))))), NvmfTransportTCP, true
+}
+
+func (e *Engine) connectReplicas(spdkClient *spdkclient.Client, replicaAddressMap map[string]string, replicaTransportAddressMap map[string]*spdkrpc.ReplicaTransportAddresses) []string {
 	replicaBdevList := []string{}
 	for replicaName, replicaAddr := range replicaAddressMap {
+		addr, transport, legacyConvention := e.pickReplicaAddress(replicaName, replicaAddr, replicaTransportAddressMap)
 		e.ReplicaStatusMap[replicaName] = &EngineReplicaStatus{
-			Address: replicaAddr,
+			Address:       replicaAddr,
+			DialedAddress: addr,
+			Transport:     transport,
 		}
 
-		bdevName, err := connectNVMfBdev(spdkClient, replicaName, replicaAddr, e.ctrlrLossTimeout, e.fastIOFailTimeoutSec, maxRetries, retryInterval)
+		bdevName, dialedAddr, dialedTransport, err := connectNVMfBdevWithTransport(spdkClient, replicaName, addr, transport, e.ctrlrLossTimeout, e.fastIOFailTimeoutSec, maxRetries, retryInterval, legacyConvention)
 		if err != nil {
-			e.log.WithError(err).Warnf("Failed to get bdev from replica %s with address %s during engine creation, will mark the mode to ERR and continue", replicaName, replicaAddr)
+			e.log.WithError(err).Warnf("Failed to get bdev from replica %s with canonical address %s dialed at %s (transport=%s) during engine creation, will mark the mode to ERR and continue", replicaName, replicaAddr, addr, transport)
 			e.ReplicaStatusMap[replicaName].Mode = types.ModeERR
 		} else {
 			// TODO: Check if a replica is really a RW replica rather than a rebuilding failed replica
 			e.ReplicaStatusMap[replicaName].Mode = types.ModeRW
 			e.ReplicaStatusMap[replicaName].BdevName = bdevName
+			// Record what was actually attached: the connect helper may have
+			// fallen back to the replica's TCP listener at primary+1, and the
+			// dial-address validation in validateAndUpdateReplicaNvme compares
+			// against these fields.
+			e.ReplicaStatusMap[replicaName].DialedAddress = dialedAddr
+			e.ReplicaStatusMap[replicaName].Transport = dialedTransport
 			replicaBdevList = append(replicaBdevList, bdevName)
 		}
 	}
@@ -413,12 +760,14 @@ func (e *Engine) SetTargetListenerANAState(spdkClient *spdkclient.Client, anaSta
 		return fmt.Errorf("engine %s has incomplete NVMe/TCP target information", e.Name)
 	}
 
+	targetAdrfam := spdkclient.DetectAddressFamily(ip)
+
 	_, err = spdkClient.NvmfSubsystemListenerSetANAState(
 		nqn,
 		ip,
 		strconv.Itoa(int(port)),
 		spdktypes.NvmeTransportTypeTCP,
-		spdktypes.NvmeAddressFamilyIPv4,
+		targetAdrfam,
 		spdkANAState,
 		spdktypes.DefaultNvmfANAGroupID,
 	)
@@ -452,16 +801,12 @@ func (e *Engine) validateReplicaSize(replicaAddressMap map[string]string) error 
 	// Validate the engine & replica sizes before creating the engine
 	replicaSizeMap := make(map[string]uint64, len(replicaAddressMap))
 	for replicaName, replicaAddr := range replicaAddressMap {
-		replicaClient, err := GetServiceClient(replicaAddr)
+		replicaSize, err := e.getReplicaSpecSize(replicaName, replicaAddr)
 		if err != nil {
 			return err
 		}
-		replica, err := replicaClient.ReplicaGet(replicaName)
-		if err != nil {
-			return errors.Wrapf(err, "failed to get replica %v from %v", replicaName, replicaAddr)
-		}
 
-		replicaSizeMap[replicaName] = replica.SpecSize
+		replicaSizeMap[replicaName] = replicaSize
 	}
 
 	// check if all replica sizes are the same
@@ -482,6 +827,26 @@ func (e *Engine) validateReplicaSize(replicaAddressMap map[string]string) error 
 	}
 
 	return nil
+}
+
+func (e *Engine) getReplicaSpecSize(replicaName, replicaAddr string) (uint64, error) {
+	replicaClient, err := GetServiceClient(replicaAddr)
+	if err != nil {
+		return 0, err
+	}
+	defer func() {
+		errClose := replicaClient.Close()
+		if errClose != nil {
+			e.log.WithError(errClose).Errorf("Failed to close replica %s client with address %s when getting replica spec size", replicaName, replicaAddr)
+		}
+	}()
+
+	replica, err := replicaClient.ReplicaGet(replicaName)
+	if err != nil {
+		return 0, errors.Wrapf(err, "failed to get replica %v from %v", replicaName, replicaAddr)
+	}
+
+	return replica.SpecSize, nil
 }
 
 // filterSalvageCandidates updates the replicaAddressMap by retaining only replicas
@@ -590,6 +955,11 @@ func (e *Engine) Delete(spdkClient *spdkclient.Client, superiorPortAllocator *co
 	}()
 
 	e.log.Info("Deleting engine")
+	if e.IsRestoring && e.restore != nil {
+		e.log.Info("Canceling volume restoration before engine deletion")
+		e.cancelCtx()
+		e.restore.Stop()
+	}
 
 	e.log.Infof("Stopping to expose RAID bdev for engine %s", e.Name)
 	switch e.Frontend {
@@ -598,8 +968,21 @@ func (e *Engine) Delete(spdkClient *spdkclient.Client, superiorPortAllocator *co
 			return errors.Wrapf(err, "failed to destroy UBLK target for engine %s", e.Name)
 		}
 	case types.FrontendSPDKTCPBlockdev, types.FrontendSPDKTCPNvmf:
+		// Best-effort teardown. A subsystem can wedge such that its
+		// per-subsystem RPCs (nvmf_subsystem_get_listeners,
+		// nvmf_delete_subsystem) hang and only return on the client timeout —
+		// e.g. after a failed replica rebuild leaves the subsystem in a stuck
+		// state. nvmf_get_subsystems still responds instantly, so the target as
+		// a whole is healthy; only operations on this one subsystem block, and
+		// no graceful SPDK call can clear it short of an instance-manager
+		// restart. If we treated that as fatal here, engine deletion would
+		// never complete: the volume stays pinned in `deleting` indefinitely
+		// and the initiator's reconnect loop floods the target with keep-alive
+		// timeouts. So proceed with deletion regardless — the orphaned
+		// subsystem is reclaimed when the instance-manager / spdk_tgt restarts.
+		// (Expand() intentionally keeps this fatal; only deletion is best-effort.)
 		if err := spdkClient.StopExposeBdev(e.NvmeTcpTarget.Nqn); err != nil && !jsonrpc.IsJSONRPCRespErrorNoSuchDevice(err) {
-			return errors.Wrapf(err, "failed to stop exposing bdev for engine %s", e.Name)
+			e.log.WithError(err).Warnf("Failed to stop exposing bdev for engine %s during deletion; proceeding so the engine can be removed (subsystem %s may leak until the instance-manager restarts)", e.Name, e.NvmeTcpTarget.Nqn)
 		}
 	}
 
@@ -617,13 +1000,26 @@ func (e *Engine) Delete(spdkClient *spdkclient.Client, superiorPortAllocator *co
 
 	requireUpdate = true
 
-	if _, err := spdkClient.BdevRaidDelete(e.Name); err != nil && !jsonrpc.IsJSONRPCRespErrorNoSuchDevice(err) {
-		return err
+	// Best-effort (see the StopExposeBdev note above): if the subsystem teardown
+	// was skipped because it wedged, the RAID bdev may still be claimed by the
+	// leftover namespace and BdevRaidDelete can fail/hang. Don't let that pin
+	// the engine in `deleting` — proceed and let the instance-manager restart
+	// reclaim it.
+	if _, rdErr := spdkClient.BdevRaidDelete(e.Name); rdErr != nil && !jsonrpc.IsJSONRPCRespErrorNoSuchDevice(rdErr) {
+		e.log.WithError(rdErr).Warnf("Failed to delete RAID bdev for engine %s during deletion; proceeding (will be reclaimed on instance-manager restart)", e.Name)
 	}
 
-	requireUpdate, err = e.disconnectReplicas(spdkClient)
-	if err != nil {
-		return err
+	// Best-effort: a failure to detach the engine's replica initiator
+	// connections must not block engine removal either. Replica lvol teardown
+	// happens independently when the replica CRs are deleted.
+	ru, drErr := e.disconnectReplicas(spdkClient)
+	requireUpdate = requireUpdate || ru
+	if drErr != nil {
+		e.log.WithError(drErr).Warnf("Failed to disconnect all replicas for engine %s during deletion; proceeding", e.Name)
+	}
+
+	if rmErr := removeEngineRecord(e.metadataDir, e.Name); rmErr != nil {
+		e.log.WithError(rmErr).Warnf("Failed to remove persisted engine record for %s", e.Name)
 	}
 
 	e.log.Info("Deleted engine")
@@ -697,12 +1093,12 @@ func (e *Engine) getWithoutLock() (res *spdkrpc.Engine) {
 		ReplicaModeMap:        map[string]spdkrpc.ReplicaMode{},
 		Snapshots:             map[string]*spdkrpc.Lvol{},
 		Frontend:              e.Frontend,
-		Endpoint:              e.Endpoint,
 		State:                 string(e.State),
 		ErrorMsg:              e.ErrorMsg,
 		IsExpanding:           e.isExpanding,
 		LastExpansionError:    e.lastExpansionError,
 		LastExpansionFailedAt: e.lastExpansionFailedAt,
+		SnapshotMaxCount:      e.SnapshotMaxCount,
 	}
 
 	if e.NvmeTcpTarget != nil {
@@ -722,6 +1118,17 @@ func (e *Engine) getWithoutLock() (res *spdkrpc.Engine) {
 	}
 
 	return res
+}
+
+func (e *Engine) SetSnapshotMaxCount(count int32) {
+	e.Lock()
+	e.SnapshotMaxCount = count
+	e.Unlock()
+
+	select {
+	case e.UpdateCh <- nil:
+	default:
+	}
 }
 
 type replicaAddFrontendSuspendResumeWrapper func(work func() error) error
@@ -780,6 +1187,9 @@ func (e *Engine) ReplicaAdd(spdkClient *spdkclient.Client, dstReplicaName, dstRe
 	// Syncing with the SPDK TGT server only when the engine is running.
 	if e.State != types.InstanceStateRunning {
 		return fmt.Errorf("invalid state %v for engine %s replica %s add start", e.State, e.Name, dstReplicaName)
+	}
+	if e.IsRestoring {
+		return fmt.Errorf("cannot add replica %s while engine %s restore is in progress", dstReplicaName, e.Name)
 	}
 
 	if _, exists := e.ReplicaStatusMap[dstReplicaName]; exists {
@@ -943,7 +1353,7 @@ func (e *Engine) replicaAddStart(spdkClient *spdkclient.Client, replicaClients m
 	}
 
 	// The destination replica attaches the source replica exposed snapshot as the external snapshot then create a head based on it.
-	dstHeadLvolAddress, err := dstReplicaServiceCli.ReplicaRebuildingDstStart(dstReplicaName, srcReplicaName, srcReplicaAddress, snapshotName, externalSnapshotAddress, rebuildingSnapshotList)
+	dstHeadLvolAddress, dstHeadLvolTransportAddrs, err := dstReplicaServiceCli.ReplicaRebuildingDstStart(dstReplicaName, srcReplicaName, srcReplicaAddress, snapshotName, externalSnapshotAddress, rebuildingSnapshotList)
 	if err != nil {
 		return nil, startUpdateRequired, nil, err
 	}
@@ -953,8 +1363,10 @@ func (e *Engine) replicaAddStart(spdkClient *spdkclient.Client, replicaClients m
 		return nil, startUpdateRequired, nil, err
 	}
 
-	// Add rebuilding replica head bdev to the base bdev list of the RAID bdev
-	dstHeadLvolBdevName, err := connectNVMfBdev(spdkClient, dstReplicaName, dstHeadLvolAddress, e.ctrlrLossTimeout, e.fastIOFailTimeoutSec, maxRetries, retryInterval)
+	// Add rebuilding replica head bdev to the base bdev list of the RAID bdev,
+	// dialing the transport (RDMA/TCP) the dst replica advertises for its head.
+	attachAddr, attachTransport, legacyConvention := e.pickRebuildDstAddress(dstHeadLvolAddress, dstHeadLvolTransportAddrs)
+	dstHeadLvolBdevName, attachedAddr, attachedTransport, err := connectNVMfBdevWithTransport(spdkClient, dstReplicaName, attachAddr, attachTransport, e.ctrlrLossTimeout, e.fastIOFailTimeoutSec, maxRetries, retryInterval, legacyConvention)
 	if err != nil {
 		return nil, startUpdateRequired, nil, err
 	}
@@ -976,13 +1388,26 @@ func (e *Engine) replicaAddStart(spdkClient *spdkclient.Client, replicaClients m
 		return nil, startUpdateRequired, nil, errors.Wrapf(err, "failed to adding the rebuilding replica %s head bdev %s to the base bdev list for engine %s", dstReplicaName, dstHeadLvolBdevName, e.Name)
 	}
 
-	e.ReplicaStatusMap[dstReplicaName] = &EngineReplicaStatus{
-		Address:  dstReplicaAddress,
-		Mode:     types.ModeWO,
-		BdevName: dstHeadLvolBdevName,
-	}
+	e.ReplicaStatusMap[dstReplicaName] = newRebuildDstReplicaStatus(dstReplicaAddress, attachedAddr, attachedTransport, dstHeadLvolBdevName)
 	startUpdateRequired = true
 	return rebuildingSnapshotList, startUpdateRequired, nil, nil
+}
+
+// newRebuildDstReplicaStatus builds the ReplicaStatusMap entry for a freshly
+// attached rebuild-destination head. It must record the address/transport that
+// were actually dialed (which may be the dst replica's TCP fallback listener
+// at primary+1) in addition to the canonical address the manager knows the
+// replica by; post-rebuild validation (validateAndUpdateReplicaNvme) compares
+// the attached bdev against dialAddress(), so omitting DialedAddress/Transport
+// here would ERR a freshly rebuilt replica whose dial fell back to TCP.
+func newRebuildDstReplicaStatus(canonicalAddress, dialedAddress string, dialedTransport NvmfTransportType, bdevName string) *EngineReplicaStatus {
+	return &EngineReplicaStatus{
+		Address:       canonicalAddress,
+		DialedAddress: dialedAddress,
+		Transport:     dialedTransport,
+		Mode:          types.ModeWO,
+		BdevName:      bdevName,
+	}
 }
 
 // replicaAddAsync runs the asynchronous phase of replica add: shallow copy
@@ -1333,6 +1758,10 @@ func (e *Engine) replicaAddFinish(srcReplicaServiceCli, dstReplicaServiceCli *cl
 
 	e.checkAndUpdateInfoFromReplicasNoLock()
 
+	if saveErr := saveEngineRecord(e.metadataDir, e); saveErr != nil {
+		e.log.WithError(saveErr).Warnf("Failed to persist engine record for %s after replica-add finish", e.Name)
+	}
+
 	if dstReplicaErr != nil {
 		e.log.Errorf("Engine failed to finish rebuilding replica %s from healthy replica %s (dstErr=%v)", dstReplicaName, srcReplicaName, dstReplicaErr)
 	} else if dstReplicaStatus != nil && dstReplicaStatus.Mode == types.ModeERR {
@@ -1450,6 +1879,10 @@ func (e *Engine) ReplicaDelete(spdkClient *spdkclient.Client, replicaName, repli
 	e.log.UpdateLoggerWithWarnOnFailure(logrus.Fields{
 		"replicaStatusMap": e.ReplicaStatusMap,
 	}, "Failed to update logger with replica status map during engine creation")
+
+	if saveErr := saveEngineRecord(e.metadataDir, e); saveErr != nil {
+		e.log.WithError(saveErr).Warnf("Failed to persist engine record for %s after replica delete", e.Name)
+	}
 
 	return nil
 }
@@ -1571,6 +2004,7 @@ func (e *Engine) getReplicaClients() (replicaClients map[string]*client.SPDKClie
 		}
 		c, err := GetServiceClient(replicaStatus.Address)
 		if err != nil {
+			e.closeReplicaClients(replicaClients)
 			return nil, err
 		}
 		replicaClients[replicaName] = c
@@ -1592,6 +2026,10 @@ func (e *Engine) closeReplicaClients(replicaClients map[string]*client.SPDKClien
 func (e *Engine) snapshotOperationPreCheckWithoutLock(replicaClients map[string]*client.SPDKClient, snapshotName string, snapshotOp SnapshotOperationType) (string, error) {
 	if snapshotOp == SnapshotOperationCreate && snapshotName == "" {
 		snapshotName = util.UUID()[:8]
+	}
+
+	if snapshotOp == SnapshotOperationCreate && e.SnapshotMaxCount > 0 && int32(len(e.SnapshotMap)) >= e.SnapshotMaxCount {
+		return "", fmt.Errorf("snapshot count %d is equal or larger than snapshotMaxCount %d", len(e.SnapshotMap), e.SnapshotMaxCount)
 	}
 
 	if snapshotOp == SnapshotOperationDelete {
@@ -1693,7 +2131,7 @@ func (e *Engine) snapshotOperationWithoutLock(spdkClient *spdkclient.Client, rep
 
 		engineErr = retrygo.Do(
 			func() error {
-				_, err := spdkClient.BdevRaidCreate(e.Name, spdktypes.BdevRaidLevel1, 0, replicaBdevList, "")
+				_, err := spdkClient.BdevRaidCreate(e.Name, spdktypes.BdevRaidLevel1, 0, replicaBdevList, "", e.deltaBitmapEnabled)
 				return err
 			},
 			retrygo.Attempts(uint(maxRetries)),
@@ -1729,12 +2167,17 @@ func (e *Engine) replicaSnapshotOperation(spdkClient *spdkclient.Client, replica
 		if err := replicaClient.ReplicaSnapshotRevert(replicaName, snapshotName); err != nil {
 			return err
 		}
-		bdevName, err := connectNVMfBdev(spdkClient, replicaName, replicaStatus.Address, e.ctrlrLossTimeout, e.fastIOFailTimeoutSec, maxRetries, retryInterval)
+		// Reconnect re-dials the recorded dial address, which is known-good
+		// from the original attach; the legacy +1 TCP fallback only applies
+		// to first-time legacy-convention dials, so it is disabled here.
+		bdevName, dialedAddr, dialedTransport, err := connectNVMfBdevWithTransport(spdkClient, replicaName, replicaStatus.dialAddress(), replicaStatus.transportOrDefault(e.replicaTransport()), e.ctrlrLossTimeout, e.fastIOFailTimeoutSec, maxRetries, retryInterval, false)
 		if err != nil {
 			return err
 		}
 		if bdevName != "" {
 			replicaStatus.BdevName = bdevName
+			replicaStatus.DialedAddress = dialedAddr
+			replicaStatus.Transport = dialedTransport
 		}
 	case SnapshotOperationPurge:
 		return replicaClient.ReplicaSnapshotPurge(replicaName)
@@ -2048,211 +2491,428 @@ func (e *Engine) BackupStatus(backupName, replicaAddress string) (*spdkrpc.Backu
 	return replicaServiceCli.ReplicaBackupStatus(backupName)
 }
 
-func (e *Engine) BackupRestore(spdkClient *spdkclient.Client, backupUrl, engineName, snapshotName string, credential map[string]string, concurrentLimit int32) (*spdkrpc.EngineBackupRestoreResponse, error) {
+// BackupRestore initiates a backup restore for the engine.
+// It returns a done channel that is closed when the restore goroutine completes
+// (whether successfully, with an error, or cancelled). Callers that set up a
+// temporary frontend connection should wait on this channel before tearing it down.
+func (e *Engine) BackupRestore(spdkClient *spdkclient.Client, backupUrl, endpoint string, credential map[string]string, concurrentLimit int32, superiorPortAllocator *commonbitmap.Bitmap) (resp *spdkrpc.EngineBackupRestoreResponse, doneCh <-chan struct{}, err error) {
 	e.log.Infof("Restoring backup %s", backupUrl)
+
+	resp = &spdkrpc.EngineBackupRestoreResponse{
+		Errors: map[string]string{},
+	}
+
+	e.Lock()
+	if err := e.precheckBackupRestore(backupUrl); err != nil {
+		e.Unlock()
+		return resp, nil, err
+	}
+	e.Unlock()
+
+	backupInfo, err := backupstore.InspectBackup(backupUrl)
+	if err != nil {
+		e.Lock()
+		e.recordBackupRestoreStartErrorLocked(spdkClient, backupUrl, "", superiorPortAllocator, err)
+		e.Unlock()
+		return resp, nil, err
+	}
 
 	e.Lock()
 	defer e.Unlock()
 
-	resp := &spdkrpc.EngineBackupRestoreResponse{
-		Errors: map[string]string{},
-	}
-
-	backupInfo, err := backupstore.InspectBackup(backupUrl)
-	if err != nil {
-		for _, replicaStatus := range e.ReplicaStatusMap {
-			resp.Errors[replicaStatus.Address] = err.Error()
-		}
-		return resp, nil
+	// need to recheck the backup restore precheck after inspecting the backup,
+	// because we release the lock during backup inspection which can take a long time, and the engine state may change when we reacquire the lock.
+	if err := e.precheckBackupRestore(backupUrl); err != nil {
+		return resp, nil, err
 	}
 
 	if backupInfo.VolumeSize != int64(e.SpecSize) {
-		return nil, fmt.Errorf("the backup volume %v size %v must be the same as the Longhorn volume size %v", backupInfo.VolumeName, backupInfo.VolumeSize, e.SpecSize)
+		err := fmt.Errorf("the backup volume %v size %v must be the same as the Longhorn volume size %v", backupInfo.VolumeName, backupInfo.VolumeSize, e.SpecSize)
+		e.recordBackupRestoreStartErrorLocked(spdkClient, backupUrl, "", superiorPortAllocator, err)
+		return resp, nil, err
 	}
 
-	e.log.Infof("Deleting raid bdev %s before restoration", e.Name)
-	if _, err := spdkClient.BdevRaidDelete(e.Name); err != nil && !jsonrpc.IsJSONRPCRespErrorNoSuchDevice(err) {
-		return nil, errors.Wrapf(err, "failed to delete raid bdev %s before restoration", e.Name)
-	}
-
-	e.log.Info("Disconnecting all replicas before restoration")
-	for replicaName, replicaStatus := range e.ReplicaStatusMap {
-		if err := disconnectNVMfBdev(spdkClient, replicaStatus.BdevName, disconnectMaxRetries, disconnectRetryInterval); err != nil {
-			e.log.Infof("Failed to remove replica %s before restoration", replicaName)
-			return nil, errors.Wrapf(err, "failed to remove replica %s before restoration", replicaName)
+	isFullRestore, err := e.backupRestorePrepare(spdkClient, backupUrl, credential, superiorPortAllocator)
+	if err != nil {
+		if !errors.Is(err, ErrAlreadyRestored) {
+			e.recordBackupRestoreStartErrorLocked(spdkClient, backupUrl, "", superiorPortAllocator, err)
 		}
-		replicaStatus.BdevName = ""
+		return resp, nil, err
+	}
+
+	lastRestored := e.restore.LastRestored
+
+	defer func() {
+		if err != nil {
+			e.IsRestoring = false
+		}
+	}()
+
+	// The frontend (NVMe-TCP initiator) is managed by EngineFrontend.
+	// Store the provided endpoint so EngineRestore.OpenVolumeDev can access the block device.
+	// Also copy it into e.restore.endpoint so OpenVolumeDev does not need to re-acquire the
+	// engine lock (which would deadlock — BackupRestore already holds e.Lock()).
+	e.log.Infof("Using endpoint %v for backup restore", endpoint)
+	e.restore.endpoint = endpoint
+
+	// Start the backup restore. The goroutine is launched only after these calls
+	// succeed so that a failure here does not leave completeBackupRestore blocked
+	// forever in waitForRestoreComplete (goroutine leak).
+	if isFullRestore {
+		e.log.Infof("Starting a new full restore for backup %v", backupUrl)
+		if err := e.backupRestore(backupUrl, concurrentLimit); err != nil {
+			e.restore.UpdateRestoreStatus(e.restore.SnapshotName, 0, err)
+			return resp, nil, errors.Wrapf(err, "failed to start full backup restore")
+		}
+		e.log.Infof("Successfully initiated full restore for %v to %v", backupUrl, e.Name)
+	} else {
+		e.log.Infof("Starting an incremental restore for backup %v", backupUrl)
+		if err := e.backupRestoreIncrementally(backupUrl, lastRestored, concurrentLimit); err != nil {
+			e.restore.UpdateRestoreStatus(e.restore.SnapshotName, 0, err)
+			return resp, nil, errors.Wrapf(err, "failed to start incremental backup restore")
+		}
+		e.log.Infof("Successfully initiated incremental restore for %v to %v", backupUrl, e.Name)
+	}
+
+	// ch is closed when completeBackupRestore finishes (success, error, or cancel).
+	// The caller (EngineFrontend) waits on this channel before tearing down the initiator.
+	ch := make(chan struct{})
+	go func() {
+		defer close(ch)
+		e.log.WithFields(logrus.Fields{
+			"snapshotName": backupInfo.SnapshotName,
+			"endpoint":     endpoint,
+		}).Info("Waiting for replica restore completion in background")
+		if err := e.completeBackupRestore(spdkClient, backupInfo.SnapshotName); err != nil {
+			e.log.WithError(err).Warn("Failed to complete backup restore")
+			return
+		}
+		e.log.WithField("snapshotName", backupInfo.SnapshotName).Info("Background backup restore completion finished")
+	}()
+
+	return resp, ch, nil
+}
+
+func (e *Engine) recordBackupRestoreStartErrorLocked(spdkClient *spdkclient.Client, backupURL, backupName string, superiorPortAllocator *commonbitmap.Bitmap, restoreErr error) {
+	if restoreErr == nil {
+		return
+	}
+
+	// If another restore is already in progress, don't overwrite its state.
+	// This guards against a TOCTOU race where a concurrent BackupRestore call
+	// started between our precheck (which released the lock) and this error
+	// recording (which re-acquired it).
+	if e.IsRestoring {
+		e.log.Warnf("Skipping restore error recording for %v: another restore is already in progress", backupURL)
+		return
+	}
+
+	if backupName == "" {
+		var err error
+		backupName, _, _, err = backupstore.DecodeBackupURL(util.UnescapeURL(backupURL))
+		if err != nil {
+			e.log.WithError(err).Warnf("Failed to decode backup URL %v while recording restore error", backupURL)
+			backupName = backupURL
+		}
+	}
+
+	if e.restore == nil {
+		e.restore = NewEngineRestore(spdkClient, backupURL, backupName, e, superiorPortAllocator)
+	} else {
+		e.restore.StartNewRestore(backupURL, backupName, true)
+	}
+	e.restore.UpdateRestoreStatus("", 0, restoreErr)
+}
+
+func (e *Engine) precheckBackupRestore(backupURL string) error {
+	if len(e.ReplicaStatusMap) == 0 {
+		return fmt.Errorf("cannot restore backup %s: no replicas available", backupURL)
+	}
+
+	for _, replicaStatus := range e.ReplicaStatusMap {
+		if replicaStatus.Mode != types.ModeRW {
+			return fmt.Errorf("cannot restore backup %s: replica %s is in mode %v",
+				backupURL, replicaStatus.Address, replicaStatus.Mode)
+		}
+	}
+
+	if e.IsRestoring {
+		return fmt.Errorf("%w", ErrRestoringInProgress)
+	}
+
+	return nil
+}
+
+func (e *Engine) backupRestorePrepare(spdkClient *spdkclient.Client, backupUrl string, credential map[string]string, superiorPortAllocator *commonbitmap.Bitmap) (isFullRestore bool, err error) {
+	backupType, err := butil.CheckBackupType(backupUrl)
+	if err != nil {
+		return false, errors.Wrapf(err, "failed to check backup type for %v", backupUrl)
+	}
+	if err = butil.SetupCredential(backupType, credential); err != nil {
+		return false, errors.Wrapf(err, "failed to setup credential for %v", backupUrl)
+	}
+
+	backupName, _, _, err := backupstore.DecodeBackupURL(util.UnescapeURL(backupUrl))
+	if err != nil {
+		return false, errors.Wrapf(err, "failed to decode backup URL %v", backupUrl)
+	}
+
+	if e.restore == nil {
+		e.restore = NewEngineRestore(spdkClient, backupUrl, backupName, e, superiorPortAllocator)
+	} else {
+		if e.restore.LastRestored == backupName {
+			return false, fmt.Errorf("%w %v", ErrAlreadyRestored, backupName)
+		}
+		if e.restore.State == btypes.ProgressStateError || e.restore.State == btypes.ProgressStateCanceled {
+			lastRestored := e.restore.LastRestored
+			e.restore = NewEngineRestore(spdkClient, backupUrl, backupName, e, superiorPortAllocator)
+			e.restore.LastRestored = lastRestored
+			if !e.canDoIncrementalRestore(e.restore, backupUrl, backupName) {
+				e.restore.LastRestored = ""
+			}
+		} else {
+			validLastRestoredBackup := e.canDoIncrementalRestore(e.restore, backupUrl, backupName)
+			e.restore.StartNewRestore(backupUrl, backupName, validLastRestoredBackup)
+		}
 	}
 
 	e.IsRestoring = true
+	e.log.WithFields(logrus.Fields{
+		"replicas":        len(e.ReplicaStatusMap),
+		"requestedBackup": backupUrl,
+		"lastRestored":    e.restore.LastRestored,
+	}).Info("Engine marked as restoring")
 
-	switch {
-	case snapshotName != "":
-		e.RestoringSnapshotName = snapshotName
-		e.log.Infof("Using input snapshot name %s for the restore", e.RestoringSnapshotName)
-	case len(e.SnapshotMap) == 0:
-		e.RestoringSnapshotName = util.UUID()
-		e.log.Infof("Using new generated snapshot name %s for the full restore", e.RestoringSnapshotName)
-	case e.RestoringSnapshotName != "":
-		e.log.Infof("Using existing snapshot name %s for the incremental restore", e.RestoringSnapshotName)
-	default:
-		e.RestoringSnapshotName = util.UUID()
-		e.log.Infof("Using new generated snapshot name %s for the incremental restore because e.FinalSnapshotName is empty", e.RestoringSnapshotName)
-	}
-
-	defer func() {
-		go func() {
-			if err := e.completeBackupRestore(spdkClient); err != nil {
-				e.log.WithError(err).Warn("Failed to complete backup restore")
-			}
-		}()
-	}()
-
-	for replicaName, replicaStatus := range e.ReplicaStatusMap {
-		e.log.Infof("Restoring backup on replica %s address %s", replicaName, replicaStatus.Address)
-
-		replicaServiceCli, err := GetServiceClient(replicaStatus.Address)
-		if err != nil {
-			e.log.WithError(err).Errorf("Failed to restore backup on replica %s with address %s", replicaName, replicaStatus.Address)
-			resp.Errors[replicaStatus.Address] = err.Error()
-			continue
-		}
-
-		func() {
-			defer func() {
-				if errClose := replicaServiceCli.Close(); errClose != nil {
-					e.log.WithError(errClose).Errorf("Failed to close replica %s client with address %s during restore backup", replicaName, replicaStatus.Address)
-				}
-			}()
-
-			err = replicaServiceCli.ReplicaBackupRestore(&client.BackupRestoreRequest{
-				BackupUrl:       backupUrl,
-				ReplicaName:     replicaName,
-				SnapshotName:    e.RestoringSnapshotName,
-				Credential:      credential,
-				ConcurrentLimit: concurrentLimit,
-			})
-			if err != nil {
-				e.log.WithError(err).Errorf("Failed to restore backup on replica %s address %s", replicaName, replicaStatus.Address)
-				resp.Errors[replicaStatus.Address] = err.Error()
-			}
-		}()
-	}
-
-	return resp, nil
+	isFullRestore = e.restore.LastRestored == ""
+	return isFullRestore, nil
 }
 
-func (e *Engine) completeBackupRestore(spdkClient *spdkclient.Client) error {
-	if err := e.waitForRestoreComplete(); err != nil {
-		return errors.Wrapf(err, "failed to wait for restore complete")
+func (e *Engine) canDoIncrementalRestore(restore *EngineRestore, backupURL, requestedBackupName string) bool {
+	if restore.LastRestored == "" {
+		e.log.Warnf("There is a restore record but last restored backup is empty with restore state %v, will do full restore instead", restore.State)
+		return false
+	}
+	if _, err := backupstore.InspectBackup(strings.Replace(backupURL, requestedBackupName, restore.LastRestored, 1)); err != nil {
+		e.log.WithError(err).Warnf("The last restored backup %v becomes invalid for incremental restore, will do full restore instead", restore.LastRestored)
+		return false
+	}
+	return true
+}
+
+func (e *Engine) backupRestore(backupURL string, concurrentLimit int32) error {
+	backupURL = butil.UnescapeURL(backupURL)
+
+	e.log.WithFields(logrus.Fields{
+		"backupURL":       backupURL,
+		"concurrentLimit": concurrentLimit,
+	}).Info("Starting full backup restore")
+
+	return backupstore.RestoreDeltaBlockBackup(e.ctx, &backupstore.DeltaRestoreConfig{
+		BackupURL:       backupURL,
+		DeltaOps:        e.restore,
+		Filename:        "",
+		ConcurrentLimit: concurrentLimit,
+	})
+}
+
+func (e *Engine) backupRestoreIncrementally(backupURL, lastRestored string, concurrentLimit int32) error {
+	backupURL = butil.UnescapeURL(backupURL)
+
+	e.log.WithFields(logrus.Fields{
+		"backupURL":       backupURL,
+		"lastRestored":    lastRestored,
+		"concurrentLimit": concurrentLimit,
+	}).Info("Starting incremental backup restore")
+
+	return backupstore.RestoreDeltaBlockBackupIncrementally(e.ctx, &backupstore.DeltaRestoreConfig{
+		BackupURL:       backupURL,
+		DeltaOps:        e.restore,
+		LastBackupName:  lastRestored,
+		Filename:        "",
+		ConcurrentLimit: concurrentLimit,
+	})
+}
+
+func (e *Engine) completeBackupRestore(spdkClient *spdkclient.Client, backupSnapshotName string) (err error) {
+	// waitForRestoreComplete only reads e.restore fields under e.restore.RLock;
+	// no engine lock is needed (and must not be held — SnapshotCreate/Delete acquire it).
+	waitErr := e.waitForRestoreComplete()
+
+	// Acquire the engine lock to mutate shared fields and tear down the temporary
+	// NVMe-TCP target. This runs regardless of success or failure so that the target
+	// is always stopped and the port always released.
+	// The EngineFrontend initiator is still connected at this point;
+	// it will be torn down after doneCh is closed (i.e. after this function returns).
+	e.Lock()
+	e.log.Infof("Finalizing backup restore state")
+
+	if !e.IsRestoring {
+		e.Unlock()
+		return fmt.Errorf("BUG: engine is not being restored")
 	}
 
-	return e.BackupRestoreFinish(spdkClient)
+	isCanceled := e.restore != nil && e.restore.State == btypes.ProgressStateCanceled
+
+	// Snapshot name recorded by a previous restore cycle (used below once the lock is dropped).
+	oldSnapshotName := ""
+	if e.restore != nil {
+		oldSnapshotName = e.restore.SnapshotName
+	}
+
+	// Stop the temporary NVMe-TCP target and release its port.
+	if e.Frontend == types.FrontendEmpty {
+		e.cleanupTemporaryNvmeTcpTargetForRestoreLocked(spdkClient, e.restore.superiorPortAllocator, "backup restore completion")
+	}
+
+	e.Unlock()
+
+	if waitErr != nil {
+		e.Lock()
+		e.IsRestoring = false
+		if e.restore != nil {
+			e.restore.UpdateRestoreStatus(e.restore.SnapshotName, 0, waitErr)
+		}
+		e.Unlock()
+		return errors.Wrapf(waitErr, "failed to wait for engine restore complete")
+	}
+
+	// Finalize restore state under the engine lock after snapshot operations complete.
+	defer func() {
+		e.Lock()
+		e.IsRestoring = false
+		if e.restore != nil {
+			if err != nil {
+				e.restore.UpdateRestoreStatus(e.restore.SnapshotName, 0, err)
+			} else {
+				e.restore.FinishRestore()
+			}
+		}
+		e.Unlock()
+	}()
+
+	if isCanceled {
+		e.log.Info("Doing nothing for canceled backup restoration")
+		return nil
+	}
+
+	// Delete previous snapshot after restore if it exists.
+	// SnapshotDelete acquires e.Lock() internally.
+	if oldSnapshotName != "" {
+		e.RLock()
+		_, snapshotExists := e.SnapshotMap[oldSnapshotName]
+		e.RUnlock()
+		if snapshotExists {
+			e.log.Infof("Deleting existing snapshot %v of the restored volume", oldSnapshotName)
+			if delErr := e.SnapshotDelete(spdkClient, oldSnapshotName); delErr != nil {
+				e.log.WithError(delErr).Warnf("Failed to delete existing snapshot %v of the restored volume", oldSnapshotName)
+			}
+		}
+	}
+
+	// Prefer using the backup source snapshot name for better traceability.
+	// Fall back to a UUID-based name if it is not available.
+	// SnapshotCreate acquires e.Lock() internally.
+	var newSnapshotName string
+	if backupSnapshotName == "" {
+		newSnapshotName = fmt.Sprintf("restore-%s", util.UUID())
+	} else {
+		newSnapshotName = fmt.Sprintf("restore-%s", backupSnapshotName)
+
+		// Avoid conflict if the snapshot already exists.
+		e.RLock()
+		_, exists := e.SnapshotMap[newSnapshotName]
+		e.RUnlock()
+		if exists {
+			suffix := util.UUID()[:5]
+			e.log.Warnf("Snapshot %v already exists, generating a unique restored snapshot name", newSnapshotName)
+			newSnapshotName = fmt.Sprintf("restore-%s-%s", backupSnapshotName, suffix)
+		}
+	}
+
+	e.log.Infof("Creating snapshot %v for the restored volume", newSnapshotName)
+	if _, createErr := e.SnapshotCreate(spdkClient, newSnapshotName); createErr != nil {
+		e.log.WithError(createErr).Warnf("Failed to create snapshot %v for the restored volume", newSnapshotName)
+	}
+
+	e.restore.Lock()
+	e.restore.SnapshotName = newSnapshotName
+	e.restore.Unlock()
+	e.log.Infof("Successfully created restored snapshot %v", newSnapshotName)
+
+	return nil
+}
+
+func (e *Engine) cleanupTemporaryNvmeTcpTargetForRestore(spdkClient *spdkclient.Client, superiorPortAllocator *commonbitmap.Bitmap, reason string) {
+	e.Lock()
+	defer e.Unlock()
+	e.cleanupTemporaryNvmeTcpTargetForRestoreLocked(spdkClient, superiorPortAllocator, reason)
+}
+
+func (e *Engine) cleanupTemporaryNvmeTcpTargetForRestoreLocked(spdkClient *spdkclient.Client, superiorPortAllocator *commonbitmap.Bitmap, reason string) {
+	if e.Frontend != types.FrontendEmpty || e.NvmeTcpTarget == nil {
+		return
+	}
+
+	if e.NvmeTcpTarget.Nqn != "" {
+		e.log.Infof("Cleaning up temporary NVMe-TCP target %s after %s", e.NvmeTcpTarget.Nqn, reason)
+		if stopErr := spdkClient.StopExposeBdev(e.NvmeTcpTarget.Nqn); stopErr != nil && !jsonrpc.IsJSONRPCRespErrorNoSuchDevice(stopErr) {
+			e.log.WithError(stopErr).Warnf("Failed to stop exposing bdev during %s", reason)
+		}
+	}
+
+	e.NvmeTcpTarget.Nqn = ""
+	e.NvmeTcpTarget.Nguid = ""
+	e.NvmeTcpTarget.IP = ""
+	if relErr := e.releasePorts(superiorPortAllocator); relErr != nil {
+		e.log.WithError(relErr).Warnf("Failed to release ports during %s", reason)
+	}
 }
 
 func (e *Engine) waitForRestoreComplete() error {
-	periodicChecker := time.NewTicker(time.Duration(restorePeriodicRefreshInterval.Seconds()) * time.Second)
-	defer periodicChecker.Stop()
+	e.log.WithFields(logrus.Fields{
+		"interval":     restorePeriodicRefreshInterval.String(),
+		"snapshotName": e.RestoringSnapshotName,
+	}).Info("Waiting for restore to complete")
 
-	var err error
-	for range periodicChecker.C {
-		isReplicaRestoreCompleted := true
-		for replicaName, replicaStatus := range e.ReplicaStatusMap {
-			if replicaStatus.Mode != types.ModeRW {
-				continue
+	err := retrygo.Do(
+		func() error {
+			e.restore.RLock()
+			restoreProgress := e.restore.Progress
+			restoreError := e.restore.Error
+			restoreState := e.restore.State
+			e.restore.RUnlock()
+
+			if restoreState == btypes.ProgressStateCanceled {
+				return retrygo.Unrecoverable(fmt.Errorf("%v", btypes.ErrorMsgRestoreCancelled))
+			}
+			if restoreProgress == 100 {
+				e.log.Infof("Backup restore is done: %v%%", restoreProgress)
+				return nil
 			}
 
-			isReplicaRestoreCompleted, err = e.isReplicaRestoreCompleted(replicaName, replicaStatus.Address)
-			if err != nil {
-				return errors.Wrapf(err, "failed to check replica %s restore status", replicaName)
+			e.log.WithFields(logrus.Fields{
+				"progress":     restoreProgress,
+				"state":        restoreState,
+				"snapshotName": e.RestoringSnapshotName,
+			}).Debug("Restore is still in progress")
+
+			if restoreError != "" {
+				err := fmt.Errorf("%v", restoreError)
+				e.log.WithError(err).Error("Found backup restoration error")
+				return retrygo.Unrecoverable(err)
 			}
 
-			if !isReplicaRestoreCompleted {
-				break
-			}
-		}
+			return fmt.Errorf("restore is still in progress")
+		},
+		retrygo.Delay(restorePeriodicRefreshInterval),
+		retrygo.MaxDelay(restorePeriodicRefreshInterval),
+		retrygo.DelayType(retrygo.FixedDelay),
+		retrygo.Attempts(0), // retry forever until success or unrecoverable error
+	)
 
-		if isReplicaRestoreCompleted {
-			e.log.Info("Backup restoration completed successfully")
-			return nil
-		}
-	}
-
-	return errors.Errorf("failed to wait for engine %s restore complete", e.Name)
-}
-
-func (e *Engine) isReplicaRestoreCompleted(replicaName, replicaAddress string) (bool, error) {
-	log := e.log.WithFields(logrus.Fields{
-		"replica": replicaName,
-		"address": replicaAddress,
-	})
-	log.Trace("Checking replica restore status")
-
-	replicaServiceCli, err := GetServiceClient(replicaAddress)
 	if err != nil {
-		return false, errors.Wrapf(err, "failed to get replica %v service client %s", replicaName, replicaAddress)
+		return err
 	}
-	defer func() {
-		if errClose := replicaServiceCli.Close(); errClose != nil {
-			log.WithError(errClose).Errorf("Failed to close replica %s client with address %s during check restore status", replicaName, replicaAddress)
-		}
-	}()
-
-	status, err := replicaServiceCli.ReplicaRestoreStatus(replicaName)
-	if err != nil {
-		return false, errors.Wrapf(err, "failed to check replica %s restore status", replicaName)
-	}
-
-	return !status.IsRestoring, nil
-}
-
-func (e *Engine) BackupRestoreFinish(spdkClient *spdkclient.Client) error {
-	updateRequired := false
-
-	e.Lock()
-	defer func() {
-		e.Unlock()
-		if updateRequired {
-			e.UpdateCh <- nil
-		}
-	}()
-
-	replicaBdevList := []string{}
-	for replicaName, replicaStatus := range e.ReplicaStatusMap {
-		replicaAddress := replicaStatus.Address
-		replicaIP, replicaPort, err := net.SplitHostPort(replicaAddress)
-		if err != nil {
-			return err
-		}
-		e.log.Infof("Attaching replica %s with address %s before finishing restoration", replicaName, replicaAddress)
-		nvmeBdevNameList, err := spdkClient.BdevNvmeAttachController(replicaName, helpertypes.GetNQN(replicaName), replicaIP, replicaPort,
-			spdktypes.NvmeTransportTypeTCP, spdktypes.NvmeAddressFamilyIPv4,
-			int32(e.ctrlrLossTimeout), replicaReconnectDelaySec, int32(e.fastIOFailTimeoutSec), replicaMultipath)
-		if err != nil {
-			return err
-		}
-
-		if len(nvmeBdevNameList) != 1 {
-			return fmt.Errorf("got unexpected nvme bdev list %v", nvmeBdevNameList)
-		}
-
-		replicaStatus.BdevName = nvmeBdevNameList[0]
-		replicaStatus.Mode = types.ModeRW
-
-		replicaBdevList = append(replicaBdevList, replicaStatus.BdevName)
-	}
-
-	e.log.Infof("Creating raid bdev %s with replicas %+v before finishing restoration", e.Name, replicaBdevList)
-	if _, err := spdkClient.BdevRaidCreate(e.Name, spdktypes.BdevRaidLevel1, 0, replicaBdevList, ""); err != nil {
-		if !jsonrpc.IsJSONRPCRespErrorFileExists(err) {
-			e.log.WithError(err).Errorf("Failed to create raid bdev before finishing restoration")
-			return err
-		}
-	}
-
-	e.IsRestoring = false
-	e.checkAndUpdateInfoFromReplicasNoLock()
-	updateRequired = true
 
 	return nil
 }
@@ -2262,41 +2922,44 @@ func (e *Engine) RestoreStatus() (*spdkrpc.RestoreStatusResponse, error) {
 		Status: map[string]*spdkrpc.ReplicaRestoreStatusResponse{},
 	}
 
-	e.Lock()
-	defer e.Unlock()
+	e.RLock()
+	defer e.RUnlock()
+
+	if e.restore == nil {
+		for replicaName, replicaStatus := range e.ReplicaStatusMap {
+			resp.Status[replicaStatus.Address] = &spdkrpc.ReplicaRestoreStatusResponse{
+				ReplicaName:    replicaName,
+				ReplicaAddress: GetBackendReplicaURL(replicaStatus.Address),
+				IsRestoring:    false,
+			}
+		}
+		return resp, nil
+	}
+
+	e.restore.RLock()
+	restoreProgress := e.restore.Progress
+	restoreError := e.restore.Error
+	restoreState := e.restore.State
+	lastRestored := e.restore.LastRestored
+	currentRestoringBackup := e.restore.CurrentRestoringBackup
+	backupURL := e.restore.BackupURL
+	e.restore.RUnlock()
 
 	for replicaName, replicaStatus := range e.ReplicaStatusMap {
-		if replicaStatus.Mode != types.ModeRW {
-			continue
+		resp.Status[replicaStatus.Address] = &spdkrpc.ReplicaRestoreStatusResponse{
+			ReplicaName:            replicaName,
+			ReplicaAddress:         GetBackendReplicaURL(replicaStatus.Address),
+			IsRestoring:            e.IsRestoring,
+			LastRestored:           lastRestored,
+			Progress:               int32(restoreProgress),
+			Error:                  restoreError,
+			State:                  string(restoreState),
+			BackupUrl:              backupURL,
+			CurrentRestoringBackup: currentRestoringBackup,
 		}
-
-		restoreStatus, err := e.getReplicaRestoreStatus(replicaName, replicaStatus.Address)
-		if err != nil {
-			return nil, err
-		}
-		resp.Status[replicaStatus.Address] = restoreStatus
 	}
 
 	return resp, nil
-}
-
-func (e *Engine) getReplicaRestoreStatus(replicaName, replicaAddress string) (*spdkrpc.ReplicaRestoreStatusResponse, error) {
-	replicaServiceCli, err := GetServiceClient(replicaAddress)
-	if err != nil {
-		return nil, err
-	}
-	defer func() {
-		if errClose := replicaServiceCli.Close(); errClose != nil {
-			e.log.WithError(errClose).Errorf("Failed to close replica client with address %s during get restore status", replicaAddress)
-		}
-	}()
-
-	status, err := replicaServiceCli.ReplicaRestoreStatus(replicaName)
-	if err != nil {
-		return nil, err
-	}
-
-	return status, nil
 }
 
 // Expand performs an online volume expansion for the Longhorn Engine using SPDK.
@@ -2388,7 +3051,7 @@ func (e *Engine) Expand(spdkClient *spdkclient.Client, size uint64) (err error) 
 
 	switch e.Frontend {
 	case types.FrontendSPDKTCPBlockdev, types.FrontendSPDKTCPNvmf:
-		cntlid := getEngineCntlid(e.Name)
+		minCntlid, maxCntlid := e.resolveCntlidRange()
 		nsUUID := getStableVolumeNsUUID(e.VolumeName)
 		// Preserve the current ANA state across the expand. If this engine
 		// was demoted to inaccessible during a switchover, re-exposing with
@@ -2401,11 +3064,11 @@ func (e *Engine) Expand(spdkClient *spdkclient.Client, size uint64) (err error) 
 		if err != nil {
 			return errors.Wrapf(err, "invalid ANA state %q for engine target %v during expand", currentANAState, e.Name)
 		}
-		e.log.Infof("Starting to expose RAID bdev for engine target %v on %v:%v with ANA state %v, cntlid %v, nsUUID %v",
-			e.Name, e.NvmeTcpTarget.IP, e.NvmeTcpTarget.Port, currentANAState, cntlid, nsUUID)
+		e.log.Infof("Starting to expose RAID bdev for engine target %v on %v:%v with ANA state %v, cntlid [%v,%v], nsUUID %v",
+			e.Name, e.NvmeTcpTarget.IP, e.NvmeTcpTarget.Port, currentANAState, minCntlid, maxCntlid, nsUUID)
 		if err := spdkClient.StartExposeBdevWithANAState(e.NvmeTcpTarget.Nqn, e.Name, e.NvmeTcpTarget.Nguid, nsUUID,
 			e.NvmeTcpTarget.IP, strconv.Itoa(int(e.NvmeTcpTarget.Port)),
-			spdkANAState, cntlid, cntlid); err != nil {
+			spdkANAState, minCntlid, maxCntlid); err != nil {
 			return errors.Wrapf(err, "failed to start exposing RAID bdev for engine target %v", e.Name)
 		}
 	case types.FrontendEmpty:
@@ -2542,7 +3205,9 @@ func (e *Engine) expandSingleReplica(spdkClient *spdkclient.Client, replicaName 
 		return err
 	}
 
-	_, err = connectNVMfBdev(spdkClient, replicaName, replicaStatus.Address, e.ctrlrLossTimeout, e.fastIOFailTimeoutSec, maxRetries, retryInterval)
+	// Reconnect re-dials the recorded dial address (see the snapshot revert
+	// path); the legacy +1 TCP fallback is for first-time legacy dials only.
+	_, _, _, err = connectNVMfBdevWithTransport(spdkClient, replicaName, replicaStatus.dialAddress(), replicaStatus.transportOrDefault(e.replicaTransport()), e.ctrlrLossTimeout, e.fastIOFailTimeoutSec, maxRetries, retryInterval, false)
 	return err
 }
 
@@ -2605,8 +3270,21 @@ func (e *Engine) reconstructRaidBdev(spdkClient *spdkclient.Client, bdevRaidUUID
 		return fmt.Errorf("no healthy replica bdevs available for RAID creation")
 	}
 
-	if _, err := spdkClient.BdevRaidCreate(e.Name, spdktypes.BdevRaidLevel1, 0, replicaBdevList, bdevRaidUUID); err != nil {
+	if _, err := spdkClient.BdevRaidCreate(e.Name, spdktypes.BdevRaidLevel1, 0, replicaBdevList, bdevRaidUUID, e.deltaBitmapEnabled); err != nil {
 		return err
+	}
+
+	// Re-apply persisted QoS limits to the freshly reconstructed raid bdev.
+	// SPDK's bdev_set_qos_limit state lives on the bdev itself, so a new
+	// bdev (even with the same name + UUID) starts with no limits.
+	if !e.QosLimits.IsZero() {
+		if qosErr := spdkClient.BdevSetQosLimit(e.Name,
+			e.QosLimits.RwIOsPerSec,
+			e.QosLimits.RwMBPerSec,
+			e.QosLimits.RMBPerSec,
+			e.QosLimits.WMBPerSec); qosErr != nil {
+			e.log.WithError(qosErr).Warn("Failed to re-apply QoS limits after raid reconstruction; proceeding with unlimited")
+		}
 	}
 
 	// wait the raid bdev is created
@@ -2734,7 +3412,11 @@ func (e *Engine) ValidateAndUpdate(spdkClient *spdkclient.Client) (err error) {
 		return err
 	}
 
+	previousModes := e.snapshotReplicaModesNoLock()
 	containValidReplica := e.validateReplicaStatusMapNoLock(bdevMap, &updateRequired)
+	// Capture the dirty bitmap of any replica that just transitioned to ERR,
+	// so a later reconnect can do an incremental (dirty-region-only) rebuild.
+	e.captureBitmapsForFaultedReplicasNoLock(spdkClient, previousModes)
 
 	e.log.UpdateLoggerWithWarnOnFailure(logrus.Fields{
 		"replicaStatusMap": e.ReplicaStatusMap,
@@ -2845,12 +3527,31 @@ func (e *Engine) validateReplicaStatusMapNoLock(bdevMap map[string]*spdktypes.Bd
 			e.log.Debugf("Engine validating replica %s with bdev name %s and address %s during ValidateAndUpdate", replicaName, replicaStatus.BdevName, replicaStatus.Address)
 			mode, err := e.validateAndUpdateReplicaNvme(replicaName, bdevMap[replicaStatus.BdevName])
 			if err != nil {
-				e.log.WithError(err).Errorf("Engine found valid NVMe for replica %v, will update the mode from %s to ERR during ValidateAndUpdate", replicaName, replicaStatus.Mode)
-				replicaStatus.Mode = types.ModeERR
-				*updateRequired = true
-			} else if replicaStatus.Mode != mode {
-				replicaStatus.Mode = mode
-				*updateRequired = true
+				// A currently-RW (healthy, serving) replica is only failed after
+				// maxReplicaValidationFailures consecutive validation failures.
+				// A single transient failure — e.g. the shared SPDK socket briefly
+				// busy while a sibling rebuild replica tears down — must not fault
+				// a healthy replica; on 2026-06-15 that turned a rebuild-dst
+				// cleanup glitch into a faulted source and a faulted volume. A
+				// genuinely dead replica keeps failing across the 3s verify loop
+				// and still reaches ERR within ~maxReplicaValidationFailures ticks.
+				// WO (rebuilding) and other non-RW replicas fail immediately as
+				// before — failing a mid-rebuild replica is cheap (it restarts).
+				if replicaStatus.Mode == types.ModeRW && replicaStatus.validationFailures+1 < maxReplicaValidationFailures {
+					replicaStatus.validationFailures++
+					e.log.WithError(err).Warnf("Engine deferring ERR for healthy replica %v (validation failure %d/%d) during ValidateAndUpdate", replicaName, replicaStatus.validationFailures, maxReplicaValidationFailures)
+				} else {
+					e.log.WithError(err).Errorf("Engine found invalid NVMe for replica %v, will update the mode from %s to ERR during ValidateAndUpdate", replicaName, replicaStatus.Mode)
+					replicaStatus.Mode = types.ModeERR
+					replicaStatus.validationFailures = 0
+					*updateRequired = true
+				}
+			} else {
+				replicaStatus.validationFailures = 0
+				if replicaStatus.Mode != mode {
+					replicaStatus.Mode = mode
+					*updateRequired = true
+				}
 			}
 		}
 
@@ -3133,7 +3834,12 @@ func (e *Engine) validateAndUpdateReplicaNvme(replicaName string, bdev *spdktype
 	}
 
 	replicaStatus := e.ReplicaStatusMap[replicaName]
-	if err := validateReplicaAddress(replicaName, bdev.Name, replicaStatus.Address, nvmeInfo); err != nil {
+	// Validate against the address the engine actually dialed, not the
+	// canonical primary Address. They differ when the engine fell back to a
+	// replica's TCP listener at port+1 (RDMA-primary replica + TCP engine):
+	// the attached NVMe bdev reports the +1 address, so comparing against the
+	// canonical Address would wrongly flag a mismatch and mark the replica ERR.
+	if err := validateReplicaAddress(replicaName, bdev.Name, replicaStatus.dialAddress(), nvmeInfo); err != nil {
 		return types.ModeERR, err
 	}
 	if err := validateControllerName(replicaName, bdev.Name, replicaStatus.BdevName); err != nil {
@@ -3197,11 +3903,24 @@ func validateAndGetSingleNvmeInfo(replicaName string, bdev *spdktypes.BdevInfo) 
 }
 
 func validateNvmeTransport(replicaName, bdevName string, nvmeInfo spdktypes.NvmeNamespaceInfo) error {
-	if !strings.EqualFold(string(nvmeInfo.Trid.Adrfam), string(spdktypes.NvmeAddressFamilyIPv4)) ||
-		!strings.EqualFold(string(nvmeInfo.Trid.Trtype), string(spdktypes.NvmeTransportTypeTCP)) {
+	// A remote replica base bdev may be attached over either NVMe-oF fabric
+	// transport: TCP (compute-node engines, or the port+1 TCP fallback) or RDMA
+	// (storage/RDMA-node engines dialing the replica's RDMA primary). Both are
+	// valid. Restricting this to TCP wrongly faulted every replica on an
+	// RDMA-transport engine, leaving the engine with no RW replica and erroring
+	// the volume. Only non-fabric (e.g. PCIe) or unknown transports are rejected.
+	if !strings.EqualFold(string(nvmeInfo.Trid.Trtype), string(spdktypes.NvmeTransportTypeTCP)) &&
+		!strings.EqualFold(string(nvmeInfo.Trid.Trtype), string(spdktypes.NvmeTransportTypeRDMA)) {
 		return fmt.Errorf(
-			"found invalid address family %s and transport type %s in a remote NVMe base bdev %s during replica %s mode validation",
-			nvmeInfo.Trid.Adrfam, nvmeInfo.Trid.Trtype, bdevName, replicaName,
+			"found invalid transport type %s in a remote NVMe base bdev %s during replica %s mode validation",
+			nvmeInfo.Trid.Trtype, bdevName, replicaName,
+		)
+	}
+	if !strings.EqualFold(string(nvmeInfo.Trid.Adrfam), string(spdktypes.NvmeAddressFamilyIPv4)) &&
+		!strings.EqualFold(string(nvmeInfo.Trid.Adrfam), string(spdktypes.NvmeAddressFamilyIPv6)) {
+		return fmt.Errorf(
+			"found invalid address family %s in a remote NVMe base bdev %s during replica %s mode validation",
+			nvmeInfo.Trid.Adrfam, bdevName, replicaName,
 		)
 	}
 	return nil
@@ -3252,4 +3971,32 @@ func (e *Engine) SetReplicaAddFinishUnlockedHook(hook func()) {
 	e.Lock()
 	defer e.Unlock()
 	e.replicaAddFinishUnlockedHook = hook
+}
+
+func GetBackendReplicaURL(address string) string {
+	return "tcp://" + address
+}
+
+// ensureNvmeTcpTargetForRestore creates a temporary NVMe-TCP target if the engine does not
+// already have one (e.g. engines with Frontend = ""). Called by EngineFrontend before
+// connecting its restore initiator so that the target address is available.
+func (e *Engine) ensureNvmeTcpTargetForRestore(spdkClient *spdkclient.Client, superiorPortAllocator *commonbitmap.Bitmap) error {
+	e.Lock()
+	defer e.Unlock()
+
+	if e.NvmeTcpTarget.IP != "" && e.NvmeTcpTarget.Port != 0 {
+		return nil // target already present (e.g. from a prior partial restore attempt)
+	}
+
+	e.log.Info("Creating temporary NVMe-TCP target for backup restore")
+	if err := e.createNVMeTCPTarget(spdkClient, superiorPortAllocator, 1, NvmeTCPANAStateOptimized); err != nil {
+		if relErr := e.releasePorts(superiorPortAllocator); relErr != nil {
+			e.log.WithError(relErr).Warn("Failed to release ports after temporary NVMe-TCP target creation failure")
+		}
+		e.NvmeTcpTarget.IP = ""
+		e.NvmeTcpTarget.Nguid = ""
+		e.NvmeTcpTarget.Nqn = ""
+		return errors.Wrap(err, "failed to create temporary NVMe-TCP target for backup restore")
+	}
+	return nil
 }

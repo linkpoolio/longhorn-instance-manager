@@ -38,21 +38,49 @@ func (s *Server) EngineCreate(ctx context.Context, req *spdkrpc.EngineCreateRequ
 	}
 
 	if e == nil {
-		s.engineMap[req.Name] = NewEngine(req.Name, req.VolumeName, req.Frontend, req.SpecSize, s.updateChs[types.InstanceTypeEngine])
+		s.engineMap[req.Name] = NewEngine(req.Name, req.VolumeName, req.Frontend, req.SpecSize, s.nodeTransport, s.updateChs[types.InstanceTypeEngine], req.SnapshotMaxCount)
 		e = s.engineMap[req.Name]
+		// Wire on-disk persistence so engine state survives an IM restart,
+		// mirroring how EngineFrontendCreate sets ef.metadataDir.
+		e.metadataDir = s.metadataDir
+		if req.QosLimits != nil {
+			e.QosLimits = QosLimits{
+				RwIOsPerSec: req.QosLimits.RwIosPerSec,
+				RwMBPerSec:  req.QosLimits.RwMbPerSec,
+				RMBPerSec:   req.QosLimits.RMbPerSec,
+				WMBPerSec:   req.QosLimits.WMbPerSec,
+			}
+		}
 	}
 
 	spdkClient := s.spdkClient
 	s.Unlock()
 
-	return e.Create(spdkClient, req.ReplicaAddressMap, req.PortCount, s.portAllocator, req.SalvageRequested)
+	return e.Create(spdkClient, req.ReplicaAddressMap, req.ReplicaTransportAddressMap, req.PortCount, s.portAllocator, req.SalvageRequested)
+}
+
+func (s *Server) EngineSnapshotMaxCountSet(ctx context.Context, req *spdkrpc.EngineSnapshotMaxCountSetRequest) (ret *emptypb.Empty, err error) {
+	if req.Name == "" {
+		return nil, grpcstatus.Error(grpccodes.InvalidArgument, "engine name is required")
+	}
+
+	s.RLock()
+	e := s.engineMap[req.Name]
+	s.RUnlock()
+
+	if e == nil {
+		return nil, grpcstatus.Errorf(grpccodes.NotFound, "cannot find engine %v for snapshot max count update", req.Name)
+	}
+
+	e.SetSnapshotMaxCount(req.Count)
+	return &emptypb.Empty{}, nil
 }
 
 // EngineDelete deletes an engine
 func (s *Server) EngineDelete(ctx context.Context, req *spdkrpc.EngineDeleteRequest) (ret *emptypb.Empty, err error) {
 	s.RLock()
-	e := s.engineMap[req.Name]
 	spdkClient := s.spdkClient
+	e := s.engineMap[req.Name]
 	s.RUnlock()
 
 	defer func() {
@@ -158,13 +186,18 @@ func (s *Server) EngineFrontendSwitchOver(ctx context.Context, req *spdkrpc.Engi
 			ef = frontend
 		}
 	}
-	spdkClient := s.spdkClient
 	s.RUnlock()
 
 	if ef == nil {
 		return nil, grpcstatus.Errorf(grpccodes.NotFound, "cannot find engine frontend or engine %v for target switchover", req.Name)
 	}
 
+	unlockVolumeHost := s.acquireVolumeHostLock(ef.VolumeName)
+	defer unlockVolumeHost()
+
+	s.RLock()
+	spdkClient := s.spdkClient
+	s.RUnlock()
 	if err := ef.SwitchOverTarget(spdkClient, req.EngineName, req.TargetAddress, req.SwitchoverPhase); err != nil {
 		return nil, toSwitchOverGRPCError(err, "failed to switch over target for %s", req.Name)
 	}
@@ -211,6 +244,29 @@ func (s *Server) EngineSetTargetListenerANAState(ctx context.Context, req *spdkr
 	return &emptypb.Empty{}, nil
 }
 
+// EngineRemoveTargetListener removes the target listener for the given transport
+// from an engine, releasing the HCA queue pair held by an old RDMA path during
+// switchover. A missing engine is treated as already-removed (no error).
+func (s *Server) EngineRemoveTargetListener(ctx context.Context, req *spdkrpc.EngineRemoveTargetListenerRequest) (ret *emptypb.Empty, err error) {
+	if req == nil || req.Name == "" {
+		return nil, grpcstatus.Error(grpccodes.InvalidArgument, "engine name is required")
+	}
+
+	s.RLock()
+	e := s.engineMap[req.Name]
+	spdkClient := s.spdkClient
+	s.RUnlock()
+
+	if e == nil {
+		return &emptypb.Empty{}, nil
+	}
+
+	if err := e.RemoveTargetListener(spdkClient, NvmfTransportType(req.Transport)); err != nil {
+		return nil, grpcstatus.Errorf(grpccodes.Internal, "failed to remove target listener for engine %s: %v", req.Name, err)
+	}
+	return &emptypb.Empty{}, nil
+}
+
 // EngineGet returns a specific engine
 func (s *Server) EngineGet(ctx context.Context, req *spdkrpc.EngineGetRequest) (ret *spdkrpc.Engine, err error) {
 	s.RLock()
@@ -244,7 +300,7 @@ func (s *Server) EngineList(ctx context.Context, req *emptypb.Empty) (*spdkrpc.E
 
 // EngineWatch returns a stream of engine updates
 func (s *Server) EngineWatch(req *emptypb.Empty, srv spdkrpc.SPDKService_EngineWatchServer) error {
-	responseCh, err := s.Subscribe(types.InstanceTypeEngine)
+	responseCh, err := s.Subscribe(srv.Context(), types.InstanceTypeEngine)
 	if err != nil {
 		return err
 	}
@@ -540,22 +596,74 @@ func (s *Server) EngineBackupStatus(ctx context.Context, req *spdkrpc.BackupStat
 
 func (s *Server) EngineBackupRestore(ctx context.Context, req *spdkrpc.EngineBackupRestoreRequest) (ret *spdkrpc.EngineBackupRestoreResponse, err error) {
 	logrus.WithFields(logrus.Fields{
-		"backup":       req.BackupUrl,
-		"engine":       req.EngineName,
-		"snapshotName": req.SnapshotName,
-		"concurrent":   req.ConcurrentLimit,
+		"backup":     req.BackupUrl,
+		"engine":     req.EngineName,
+		"concurrent": req.ConcurrentLimit,
 	}).Info("Restoring backup")
 
 	s.RLock()
-	e := s.engineMap[req.EngineName]
-	spdkClient := s.spdkClient
-	s.RUnlock()
-
-	if e == nil {
+	e, exist := s.engineMap[req.EngineName]
+	if !exist {
+		s.RUnlock()
 		return nil, grpcstatus.Errorf(grpccodes.NotFound, "cannot find engine %v for restoring backup", req.EngineName)
 	}
 
-	return e.BackupRestore(spdkClient, req.BackupUrl, req.EngineName, req.SnapshotName, req.Credential, req.ConcurrentLimit)
+	// Backup restore is only supported when the engine has no frontend (empty EngineFrontend).
+	// Reject requests if any frontend is configured.
+	for _, frontend := range s.engineFrontendMap {
+		frontend.RLock()
+		engineName := frontend.EngineName
+		frontendType := frontend.Frontend
+		frontendName := frontend.Name
+		frontend.RUnlock()
+
+		if engineName == req.EngineName && frontendType != types.FrontendEmpty {
+			s.RUnlock()
+			return nil, grpcstatus.Errorf(grpccodes.FailedPrecondition, "cannot restore backup: engine %v has a non-empty frontend %v", req.EngineName, frontendName)
+		}
+	}
+
+	spdkClient := s.spdkClient
+	portAllocator := s.portAllocator
+	s.RUnlock()
+
+	// Create a temporary EngineFrontend for the duration of this restore.
+	// It is NOT registered in engineFrontendMap and is discarded on return.
+	//
+	// FrontendSPDKTCPBlockdev causes BackupRestore to create an NVMe-TCP initiator
+	// and expose a block device that EngineRestore.OpenVolumeDev can open.
+	//
+	// The channel must be buffered with capacity 2: EngineFrontend.BackupRestore sends
+	// once on the success path (via defer) and the teardown goroutine sends once on
+	// completion. There is no reader, so an unbuffered channel would block both senders
+	// permanently. The buffer absorbs both sends and the channel is GC'd with tempEF.
+	e.RLock()
+	volumeName := e.VolumeName
+	specSize := e.SpecSize
+	e.RUnlock()
+
+	throwawayUpdateCh := make(chan interface{}, 2)
+	tempEF := NewEngineFrontend(
+		e.Name+"-restore",
+		e.Name,
+		volumeName,
+		types.FrontendSPDKTCPBlockdev,
+		specSize,
+		types.DefaultUblkQueueDepth,
+		types.DefaultUblkNumberOfQueue,
+		throwawayUpdateCh,
+	)
+
+	logrus.WithFields(logrus.Fields{
+		"enginefrontend": tempEF.Name,
+		"engine":         tempEF.EngineName,
+		"volume":         tempEF.VolumeName,
+		"frontend":       tempEF.Frontend,
+		"replicas":       len(e.ReplicaStatusMap),
+		"specSize":       e.SpecSize,
+	}).Info("Creating temporary engine frontend for backup restore request")
+
+	return tempEF.BackupRestore(e, spdkClient, req.BackupUrl, req.Credential, req.ConcurrentLimit, portAllocator)
 }
 
 func (s *Server) EngineRestoreStatus(ctx context.Context, req *spdkrpc.RestoreStatusRequest) (*spdkrpc.RestoreStatusResponse, error) {
@@ -564,7 +672,7 @@ func (s *Server) EngineRestoreStatus(ctx context.Context, req *spdkrpc.RestoreSt
 	s.RUnlock()
 
 	if e == nil {
-		return nil, grpcstatus.Errorf(grpccodes.NotFound, "cannot find engine %v for backup creation", req.EngineName)
+		return nil, grpcstatus.Errorf(grpccodes.NotFound, "cannot find engine %v for restore status", req.EngineName)
 	}
 
 	resp, err := e.RestoreStatus()
@@ -573,4 +681,36 @@ func (s *Server) EngineRestoreStatus(ctx context.Context, req *spdkrpc.RestoreSt
 		return nil, grpcstatus.Errorf(grpccodes.Internal, "%v", err)
 	}
 	return resp, nil
+}
+
+// EngineSetQosLimit applies new QoS limits to a running engine's raid bdev
+// at runtime. Used by longhorn-manager to push StorageClass-derived QoS
+// changes onto attached volumes without re-creating them.
+func (s *Server) EngineSetQosLimit(ctx context.Context, req *spdkrpc.EngineSetQosLimitRequest) (*emptypb.Empty, error) {
+	if req.Name == "" {
+		return nil, grpcstatus.Error(grpccodes.InvalidArgument, "engine name is required")
+	}
+	if req.QosLimits == nil {
+		return nil, grpcstatus.Error(grpccodes.InvalidArgument, "qos_limits is required (use all-zero fields for unlimited)")
+	}
+
+	s.RLock()
+	e := s.engineMap[req.Name]
+	spdkClient := s.spdkClient
+	s.RUnlock()
+
+	if e == nil {
+		return nil, grpcstatus.Errorf(grpccodes.NotFound, "cannot find engine %v", req.Name)
+	}
+
+	limits := QosLimits{
+		RwIOsPerSec: req.QosLimits.RwIosPerSec,
+		RwMBPerSec:  req.QosLimits.RwMbPerSec,
+		RMBPerSec:   req.QosLimits.RMbPerSec,
+		WMBPerSec:   req.QosLimits.WMbPerSec,
+	}
+	if err := e.SetQosLimit(spdkClient, limits); err != nil {
+		return nil, grpcstatus.Errorf(grpccodes.Internal, "failed to set QoS for engine %v: %v", req.Name, err)
+	}
+	return &emptypb.Empty{}, nil
 }

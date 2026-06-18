@@ -11,6 +11,7 @@ import (
 	"github.com/avast/retry-go/v4"
 	"github.com/cockroachdb/errors"
 	"github.com/sirupsen/logrus"
+	"golang.org/x/sys/unix"
 
 	commonns "github.com/longhorn/go-common-libs/ns"
 	commontypes "github.com/longhorn/go-common-libs/types"
@@ -22,8 +23,9 @@ import (
 )
 
 const (
-	LockFile    = "/var/run/longhorn-spdk.lock"
-	LockTimeout = 120 * time.Second
+	LockDir        = "/var/run/longhorn"
+	LockFilePrefix = LockDir + "/spdk"
+	LockTimeout    = 120 * time.Second
 
 	HostProc = "/host/proc"
 
@@ -76,6 +78,13 @@ type Initiator struct {
 	logger logrus.FieldLogger
 }
 
+type initiatorLock struct {
+	lock      *commonns.FileLock
+	operation string
+	logger    logrus.FieldLogger
+	lockFile  string
+}
+
 type NVMeTCPInfo struct {
 	SubsystemNQN       string
 	UUID               string
@@ -83,6 +92,12 @@ type NVMeTCPInfo struct {
 	TransportServiceID string
 	ControllerName     string
 	NamespaceName      string
+
+	// Transport is the NVMe-oF transport for this initiator connection.
+	// Empty string means TCP (legacy behavior). Set to "rdma" to use
+	// NVMe-oF RDMA. The name NVMeTCPInfo is retained for backward
+	// compatibility with callers that predate RDMA support.
+	Transport string
 }
 
 type UblkInfo struct {
@@ -133,43 +148,81 @@ func NewInitiator(name, hostProc string, nvmeTCPInfo *NVMeTCPInfo, ublkInfo *Ubl
 	}, nil
 }
 
-func (i *Initiator) newLock() (*commonns.FileLock, error) {
+// lockFilePath returns the per-volume lock file path. Each volume/initiator
+// gets its own lock file so that operations on different volumes can proceed
+// in parallel. The lock serializes operations within the same volume only
+// (e.g., preventing concurrent Start and Stop on the same NVMe subsystem).
+func (i *Initiator) lockFilePath() string {
+	return fmt.Sprintf("%s-%s.lock", LockFilePrefix, i.Name)
+}
+
+func (i *Initiator) newLock(operation string) (*initiatorLock, error) {
 	if i.hostProc != commontypes.HostProcDirectory {
 		return nil, fmt.Errorf("invalid host proc path %s for initiator %s, supported path is %s", i.hostProc, i.Name, commontypes.HostProcDirectory)
 	}
 
-	lock := commonns.NewLock(LockFile, LockTimeout)
+	if _, err := commonns.CreateDirectory(LockDir, time.Time{}); err != nil {
+		return nil, errors.Wrapf(err, "failed to create lock directory %s for initiator %s", LockDir, i.Name)
+	}
+
+	lockFile := i.lockFilePath()
+	lock := commonns.NewLock(lockFile, LockTimeout)
 	if err := lock.Lock(); err != nil {
 		return nil, errors.Wrapf(err, "failed to get file lock for initiator %s", i.Name)
 	}
 
-	return lock, nil
+	il := &initiatorLock{
+		lock:      lock,
+		operation: operation,
+		logger:    i.logger,
+		lockFile:  lockFile,
+	}
+
+	return il, nil
 }
 
-// DiscoverNVMeTCPTarget discovers a target
+func (lock *initiatorLock) Unlock() {
+	if lock == nil || lock.lock == nil {
+		return
+	}
+	lock.lock.Unlock()
+}
+
+// transport returns the NVMe-oF transport configured on NVMeTCPInfo, falling
+// back to DefaultTransportType (TCP) when the info or the field is unset.
+func (i *Initiator) transport() string {
+	if i.NVMeTCPInfo != nil && i.NVMeTCPInfo.Transport != "" {
+		return i.NVMeTCPInfo.Transport
+	}
+	return DefaultTransportType
+}
+
+// DiscoverNVMeTCPTarget discovers a target over the transport configured on
+// NVMeTCPInfo (TCP when unset).
 func (i *Initiator) DiscoverNVMeTCPTarget(ip, port string) (string, error) {
 	if i.hostProc != "" {
-		lock, err := i.newLock()
+		lock, err := i.newLock("DiscoverNVMeTCPTarget")
 		if err != nil {
 			return "", err
 		}
 		defer lock.Unlock()
 	}
 
-	return DiscoverTarget(ip, port, i.executor)
+	return DiscoverTargetWithTransport(i.transport(), ip, port, i.executor)
 }
 
-// ConnectNVMeTCPTarget connects to a target
+// ConnectNVMeTCPTarget connects to a target over the transport configured on
+// NVMeTCPInfo (TCP when unset).
 func (i *Initiator) ConnectNVMeTCPTarget(ip, port, nqn string) (string, error) {
 	if i.hostProc != "" {
-		lock, err := i.newLock()
+		lock, err := i.newLock("ConnectNVMeTCPTarget")
 		if err != nil {
 			return "", err
 		}
 		defer lock.Unlock()
 	}
 
-	return ConnectTarget(ip, port, nqn, i.executor)
+	return ConnectTargetWithTransport(i.transport(), ip, port, nqn, i.executor)
 }
 
 // executeNVMeTCPPathOp validates initiator state, acquires the file lock, and
@@ -190,7 +243,7 @@ func (i *Initiator) executeNVMeTCPPathOp(transportAddress, transportServiceID, o
 	}
 
 	if i.hostProc != "" {
-		lock, err := i.newLock()
+		lock, err := i.newLock(opName)
 		if err != nil {
 			return err
 		}
@@ -220,7 +273,7 @@ func (i *Initiator) DisconnectNVMeTCPTarget() error {
 		return fmt.Errorf("failed to DisconnectNVMeTCPTarget because nvmeTCPInfo is nil")
 	}
 	if i.hostProc != "" {
-		lock, err := i.newLock()
+		lock, err := i.newLock("DisconnectNVMeTCPTarget")
 		if err != nil {
 			return err
 		}
@@ -254,7 +307,7 @@ func (i *Initiator) WaitForNVMeTCPConnect(maxRetries int, retryInterval time.Dur
 		return fmt.Errorf("failed to WaitForNVMeTCPConnect because nvmeTCPInfo is nil")
 	}
 	if i.hostProc != "" {
-		lock, err := i.newLock()
+		lock, err := i.newLock("WaitForNVMeTCPConnect")
 		if err != nil {
 			return err
 		}
@@ -296,7 +349,7 @@ func (i *Initiator) WaitForNVMeTCPTargetDisconnect(maxRetries int, retryInterval
 		return fmt.Errorf("failed to WaitForNVMeTCPTargetDisconnect because nvmeTCPInfo is nil")
 	}
 	if i.hostProc != "" {
-		lock, err := i.newLock()
+		lock, err := i.newLock("WaitForNVMeTCPTargetDisconnect")
 		if err != nil {
 			return err
 		}
@@ -352,7 +405,7 @@ func (i *Initiator) WaitForNVMeTCPTargetDisconnect(maxRetries int, retryInterval
 // Suspend suspends the device mapper device for the NVMe/TCP initiator
 func (i *Initiator) Suspend(noflush, nolockfs bool) error {
 	if i.hostProc != "" {
-		lock, err := i.newLock()
+		lock, err := i.newLock("Suspend")
 		if err != nil {
 			return err
 		}
@@ -376,7 +429,7 @@ func (i *Initiator) Suspend(noflush, nolockfs bool) error {
 // Resume resumes the device mapper device for the NVMe/TCP initiator
 func (i *Initiator) Resume() error {
 	if i.hostProc != "" {
-		lock, err := i.newLock()
+		lock, err := i.newLock("Resume")
 		if err != nil {
 			return err
 		}
@@ -440,7 +493,7 @@ func (i *Initiator) StartNvmeTCPInitiator(transportAddress, transportServiceID s
 	}).Info("Starting NVMe/TCP initiator")
 
 	if i.hostProc != "" {
-		lock, err := i.newLock()
+		lock, err := i.newLock("StartNvmeTCPInitiator")
 		if err != nil {
 			return false, err
 		}
@@ -512,14 +565,53 @@ func (i *Initiator) StartNvmeTCPInitiator(transportAddress, transportServiceID s
 	return dmDeviceIsBusy, nil
 }
 
+func (i *Initiator) isEndpointValid() bool {
+	if i.dev == nil {
+		return false
+	}
+
+	var st unix.Stat_t
+	if err := unix.Stat(i.Endpoint, &st); err != nil {
+		i.logger.WithError(err).Warnf("Failed to stat endpoint %v, removing and recreating", i.Endpoint)
+		return false
+	}
+
+	if (st.Mode & unix.S_IFMT) != unix.S_IFBLK {
+		i.logger.Warnf("Endpoint %v exists but is not a block device (mode=0x%x), removing stale entry",
+			i.Endpoint, st.Mode)
+		return false
+	}
+
+	actualMajor := int(unix.Major(st.Rdev))
+	actualMinor := int(unix.Minor(st.Rdev))
+	if actualMajor != i.dev.Export.Major || actualMinor != i.dev.Export.Minor {
+		i.logger.Warnf("Endpoint %v has stale major:minor %d:%d, expected %d:%d",
+			i.Endpoint, actualMajor, actualMinor, i.dev.Export.Major, i.dev.Export.Minor)
+		return false
+	}
+
+	return true
+}
+
 func (i *Initiator) createEndpoint() error {
 	exist, err := i.isEndpointExist()
 	if err != nil {
 		return errors.Wrapf(err, "failed to check if endpoint %v exists for NVMe/TCP initiator %s", i.Endpoint, i.Name)
 	}
 	if exist {
-		i.logger.Infof("Skipping endpoint %v creation for NVMe/TCP initiator", i.Endpoint)
-		return nil
+		if i.dev != nil {
+			if i.isEndpointValid() {
+				i.logger.Infof("Reusing existing valid endpoint %v for NVMe/TCP initiator", i.Endpoint)
+				i.isUp = true
+				return nil
+			}
+			if removeErr := util.RemoveDevice(i.Endpoint); removeErr != nil {
+				return errors.Wrapf(removeErr, "failed to remove stale endpoint %v for NVMe/TCP initiator %s", i.Endpoint, i.Name)
+			}
+		} else {
+			i.logger.Infof("Skipping endpoint %v creation for NVMe/TCP initiator (no dev info to validate)", i.Endpoint)
+			return nil
+		}
 	}
 
 	if err := i.makeEndpoint(); err != nil {
@@ -539,7 +631,7 @@ func (i *Initiator) StartUblkInitiator(spdkClient *client.Client, dmDeviceAndEnd
 	}
 
 	if i.hostProc != "" {
-		lock, err := i.newLock()
+		lock, err := i.newLock("StartUblkInitiator")
 		if err != nil {
 			return false, err
 		}
@@ -730,6 +822,7 @@ func (i *Initiator) ensureNVMeTCPPathWithoutLock(transportAddress, transportServ
 		*i.NVMeTCPInfo = previousInfo
 		return err
 	}
+
 	if err := i.waitAndLoadNVMeDeviceInfoWithoutLock(transportAddress, transportServiceID); err != nil {
 		cleanupConnection(err)
 		*i.NVMeTCPInfo = previousInfo
@@ -772,20 +865,21 @@ func (i *Initiator) discoverAndConnectNVMeTCPTarget(transportAddress, transportS
 			// This avoids "failed to add controller" errors from nvme-cli 2.x
 			// when the kernel already has NVMe-oF connections to the same
 			// target address with the same hostNQN/hostID.
+			transport := i.transport()
 			if i.NVMeTCPInfo.SubsystemNQN != "" {
 				subsystemNQN = i.NVMeTCPInfo.SubsystemNQN
-				i.logger.Infof("Using pre-configured SubsystemNQN %s for target %s:%s, skipping discovery",
-					subsystemNQN, transportAddress, transportServiceID)
+				i.logger.Infof("Using pre-configured SubsystemNQN %s for target %s:%s (transport=%s), skipping discovery",
+					subsystemNQN, transportAddress, transportServiceID, transport)
 			} else {
-				i.logger.Infof("Discovering NVMe/TCP target %s:%s", transportAddress, transportServiceID)
-				subsystemNQN, e = DiscoverTarget(transportAddress, transportServiceID, i.executor)
+				i.logger.Infof("Discovering NVMe-oF target %s:%s (transport=%s)", transportAddress, transportServiceID, transport)
+				subsystemNQN, e = DiscoverTargetWithTransport(transport, transportAddress, transportServiceID, i.executor)
 				if e != nil {
-					return errors.Wrapf(e, "discover NVMe/TCP target %s:%s failed", transportAddress, transportServiceID)
+					return errors.Wrapf(e, "discover NVMe-oF target %s:%s (transport=%s) failed", transportAddress, transportServiceID, transport)
 				}
 			}
 
-			i.logger.Infof("Connecting to NVMe/TCP target %s:%s with subsystemNQN %s", transportAddress, transportServiceID, subsystemNQN)
-			controllerName, e = ConnectTarget(transportAddress, transportServiceID, subsystemNQN, i.executor)
+			i.logger.Infof("Connecting to NVMe-oF target %s:%s with subsystemNQN %s (transport=%s)", transportAddress, transportServiceID, subsystemNQN, transport)
+			controllerName, e = ConnectTargetWithTransport(transport, transportAddress, transportServiceID, subsystemNQN, i.executor)
 			if e != nil {
 				// "already connected" means the path is present in the kernel
 				// but GetDevices() couldn't find a namespace device yet (e.g.
@@ -851,11 +945,20 @@ func (i *Initiator) findControllerBySubsystem(nqn, transportAddress, transportSe
 // Stop stops the NVMe/TCP initiator
 func (i *Initiator) Stop(spdkClient *client.Client, dmDeviceAndEndpointCleanupRequired, deferDmDeviceCleanup, returnErrorForBusyDevice bool) (bool, error) {
 	if i.hostProc != "" {
-		lock, err := i.newLock()
+		lock, err := i.newLock("Stop")
 		if err != nil {
 			return false, err
 		}
-		defer lock.Unlock()
+		defer func() {
+			// Remove the lock file while still holding the lock to avoid
+			// an unlink race (where a waiter locks the unlinked inode while
+			// a new arrival creates and locks a fresh file at the same path).
+			errRemove := os.Remove(i.lockFilePath())
+			if errRemove != nil && !os.IsNotExist(errRemove) {
+				i.logger.WithError(errRemove).Warnf("Failed to remove lock file %s after stopping initiator %s", i.lockFilePath(), i.Name)
+			}
+			lock.Unlock()
+		}()
 	}
 
 	return i.stopWithoutLock(spdkClient, dmDeviceAndEndpointCleanupRequired, deferDmDeviceCleanup, returnErrorForBusyDevice)
@@ -955,6 +1058,40 @@ func (i *Initiator) GetEndpoint() string {
 	return ""
 }
 
+// GetExecutor exposes the underlying namespace executor so callers that
+// already hold an Initiator can reuse its nsenter setup for nvme-cli
+// operations without constructing a new one. Needed by transport-specific
+// teardown paths (e.g. explicit RDMA controller disconnect during
+// switchover).
+//
+// Concurrency contract: anything run through the returned executor bypasses
+// the per-volume file lock that Initiator methods take. Callers must not use
+// it concurrently with other Initiator operations on the same volume; prefer
+// a locked convenience method (e.g. DisconnectNVMeController) where one
+// exists.
+func (i *Initiator) GetExecutor() *commonns.Executor {
+	return i.executor
+}
+
+// DisconnectNVMeController disconnects the single NVMe controller matching
+// the given NQN, IP, and port while holding the per-volume file lock. It is
+// the locked equivalent of DisconnectController(nqn, ip, port, GetExecutor())
+// and should be preferred by teardown paths (e.g. explicit RDMA controller
+// disconnect during switchover) so they cannot race other Initiator
+// operations on the same volume. Returns nil when no matching controller is
+// found (already disconnected).
+func (i *Initiator) DisconnectNVMeController(nqn, ip, port string) error {
+	if i.hostProc != "" {
+		lock, err := i.newLock("DisconnectNVMeController")
+		if err != nil {
+			return err
+		}
+		defer lock.Unlock()
+	}
+
+	return DisconnectController(nqn, ip, port, i.executor)
+}
+
 // WaitForControllerLive waits for the NVMe controller at the given address to
 // reach "live" state. This is needed after nvme connect which returns
 // immediately while the TCP handshake completes asynchronously.
@@ -1013,7 +1150,7 @@ func (i *Initiator) WaitForControllerLive(transportAddress, transportServiceID s
 // GetDevice returns the device information
 func (i *Initiator) LoadNVMeDeviceInfo(transportAddress, transportServiceID, subsystemNQN string) (err error) {
 	if i.hostProc != "" {
-		lock, err := i.newLock()
+		lock, err := i.newLock("LoadNVMeDeviceInfo")
 		if err != nil {
 			return err
 		}
@@ -1184,11 +1321,32 @@ func (i *Initiator) removeEndpoint() error {
 func (i *Initiator) removeLinearDmDevice(force, deferred bool) error {
 	dmDevPath := getDmDevicePath(i.Name)
 	if _, err := os.Stat(dmDevPath); err != nil {
+		if os.IsNotExist(err) {
+			// Already removed -- the goal state of this function.
+			return nil
+		}
 		return err
 	}
 
 	i.logger.Info("Removing linear dm device")
-	return util.DmsetupRemove(i.Name, force, deferred, i.executor)
+	if err := util.DmsetupRemove(i.Name, force, deferred, i.executor); err != nil {
+		// A crash can leave a stale /dev/mapper node behind without a
+		// backing dm device; the remove ioctl then fails with ENXIO ("No
+		// such device or address"). Treating that as fatal wedges every
+		// initiator restart on the volume (observed as engine frontends
+		// flapping forever after an spdk_tgt crash). The device is
+		// already gone: clean up the stale node and succeed.
+		if dmsetupRemoveErrIsAlreadyGone(err) {
+			i.logger.WithError(err).Warn("dm device already gone; removing stale device node")
+			if rmErr := os.Remove(dmDevPath); rmErr != nil && !os.IsNotExist(rmErr) {
+				return errors.Wrapf(rmErr, "failed to remove stale dm device node %s", dmDevPath)
+			}
+			return nil
+		}
+		return err
+	}
+
+	return nil
 }
 
 func (i *Initiator) createLinearDmDevice() error {
@@ -1273,7 +1431,7 @@ func (i *Initiator) suspendLinearDmDevice(noflush, nolockfs bool) error {
 // ReloadDmDevice reloads the linear dm device
 func (i *Initiator) ReloadDmDevice() (err error) {
 	if i.hostProc != "" {
-		lock, err := i.newLock()
+		lock, err := i.newLock("ReloadDmDevice")
 		if err != nil {
 			return err
 		}
@@ -1390,4 +1548,12 @@ func (i *Initiator) reloadLinearDmDevice() error {
 
 func getDmDevicePath(name string) string {
 	return filepath.Join("/dev/mapper", name)
+}
+
+// dmsetupRemoveErrIsAlreadyGone reports whether a dmsetup remove failure means
+// the dm device no longer exists (ENXIO from the remove ioctl) -- e.g. a crash
+// left a stale /dev/mapper node behind without a backing device. That state is
+// the removal's goal and must not be treated as fatal.
+func dmsetupRemoveErrIsAlreadyGone(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "No such device")
 }
