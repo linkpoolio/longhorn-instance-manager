@@ -159,18 +159,52 @@ function cleanup_spdk_resources() {
         log "Successfully sent SIGTERM to go-spdk-helper"
     fi
 
-    # Wait for spdk_tgt to fully exit before returning. Without this, kubelet's
-    # terminationGracePeriodSeconds clock can expire while SPDK is still
-    # flushing its blobstore, forcing SIGKILL mid-flush. That leaves the
-    # on-disk dirty bit set and the next boot runs a full blobstore recovery
-    # (15-30 min on a multi-TiB disk). Cleanly exiting here skips recovery
-    # entirely. Cap at 270s: grace period is 300s, leaving 30s headroom.
-    local deadline=$(( $(date +%s) + 270 ))
+    # Wait for spdk_tgt to exit after SIGTERM. A healthy shutdown flushes its
+    # blobstore and exits within seconds, so this loop normally breaks almost
+    # immediately and the cap below never bites. The cap matters only for a
+    # *wedged* spdk_tgt -- e.g. one stuck tearing down NVMe-oF controllers that
+    # are themselves stuck in an infinite reconnect loop after a peer storage
+    # node was rebooted. Such a target never exits on its own; waiting out the
+    # old 270s cap left the pod in Terminating for minutes (an apparent zombie)
+    # until kubelet SIGKILLed it at terminationGracePeriodSeconds anyway.
+    #
+    # So: give it a bounded grace for a clean flush, then SIGKILL spdk_tgt
+    # ourselves and force-fail any dm device still mapping its now-dead target,
+    # so the pod is ALWAYS reaped promptly regardless of spdk_tgt's state. A
+    # wedged shutdown would have been SIGKILLed by kubelet at the 300s grace
+    # with the same un-flushed (dirty) blobstore, so killing at the bound here
+    # is never worse for on-disk state -- only faster to reap. The bound is
+    # tunable via SPDK_TGT_SHUTDOWN_GRACE_SEC (default 60s, well under the 300s
+    # pod grace and far above any healthy flush).
+    local grace_sec="${SPDK_TGT_SHUTDOWN_GRACE_SEC:-60}"
+    local deadline=$(( $(date +%s) + grace_sec ))
     # Use the same exact process check as above. A log tee process must not keep
     # PreStop waiting after the real spdk_tgt is gone.
     while spdk_tgt_is_running; do
         if [[ $(date +%s) -ge ${deadline} ]]; then
-            log "Timed out waiting for spdk_tgt to exit; blobstore may recover on next boot"
+            log "spdk_tgt did not exit within ${grace_sec}s of SIGTERM (wedged shutdown); escalating to SIGKILL so the pod is reaped now"
+            local pid
+            for pid in $(get_spdk_tgt_pids); do
+                if kill -9 "$pid" 2>/dev/null; then
+                    log "SIGKILLed wedged spdk_tgt pid ${pid}"
+                fi
+            done
+            # spdk_tgt's NVMe-oF target is now dead. Any dm device still mapping
+            # a /dev/longhorn volume onto it has in-flight I/O parked in D-state
+            # that would defeat the container's SIGKILL and re-zombie the pod.
+            # Force-fail them (dm "error" target) exactly like the crashed-spdk
+            # branch above, so stuck I/O is released and the pod can be reaped.
+            sleep 1
+            local device
+            local stale_devices=($(get_v2_devices))
+            for device in "${stale_devices[@]}"; do
+                if timeout 10 dmsetup remove --force "$device"; then
+                    log "Force-removed stale device-mapper device after SIGKILL: $device"
+                else
+                    log "Failed to force-remove device-mapper device after SIGKILL (relying on container SIGKILL): $device"
+                fi
+                rm -f "/host/dev/longhorn/$device"
+            done
             return
         fi
         sleep 1
