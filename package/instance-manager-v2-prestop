@@ -76,24 +76,40 @@ spdk_tgt_is_running() {
 function cleanup_spdk_resources() {
     log "Caught termination signal. Cleaning up SPDK resources..."
 
-    # If spdk_tgt is not running it has already exited or crashed. In that
-    # case the JSON-RPC socket is dead and any dm device still pointing at the
-    # vanished NVMe-oF target has stuck (uninterruptible D-state) I/O. Draining
-    # listeners over RPC or running `dmsetup remove` against those devices then
-    # BLOCKS FOREVER, so PreStop never returns: kubelet waits out the entire
-    # terminationGracePeriodSeconds, the wedged kernel I/O defeats the final
-    # SIGKILL too, and the pod is left stuck in Terminating — a zombie the
-    # instance-manager controller cannot reap, so a crashed spdk_tgt never gets
-    # its pod recreated (it has to be force-deleted by hand). There is nothing
-    # to gracefully drain once spdk_tgt is gone, so return immediately and let
-    # kubelet finish terminating the pod.
-    #
     # Do not use `pgrep -f spdk_tgt`: the log tee command contains
     # "/log/spdk_tgt.log" in its argv and can falsely look like a live SPDK
     # process after spdk_tgt has crashed. Use the PID written by the wrapper,
     # with an exact argv[0] fallback scan for older pods.
     if ! spdk_tgt_is_running; then
-        log "spdk_tgt is not running (already exited or crashed); nothing to drain, exiting prestop"
+        # spdk_tgt has already exited or crashed. Its NVMe-oF target is gone,
+        # so any dm device still mapping a /dev/longhorn volume onto that target
+        # has in-flight I/O parked in uninterruptible D-state. That wedged
+        # kernel I/O defeats the container's final SIGKILL, so the pod hangs in
+        # Terminating forever -- an un-reapable zombie the instance-manager
+        # controller cannot recreate, which is why a crashed spdk_tgt used to
+        # need a manual `kubectl delete --force`. Any workload still mounted on
+        # those devices stays blocked in D-state too.
+        #
+        # We cannot drain gracefully (the JSON-RPC socket died with spdk_tgt),
+        # and a plain `dmsetup remove` would itself block forever here: it
+        # suspends+flushes, waiting on the very I/O that can never complete.
+        # `dmsetup remove --force` instead swaps in the dm "error" target, which
+        # fails all outstanding and future I/O with EIO immediately -- releasing
+        # the D-state waiters so the device can be torn down, the container
+        # reaped, and the pod recreated with a fresh spdk_tgt. The workload sees
+        # I/O errors (recoverable when the volume reattaches) instead of an
+        # unbounded hang. Bound each call so a single uncooperative device can't
+        # re-hang PreStop.
+        log "spdk_tgt is not running (crashed/exited); force-failing stale dm devices so stuck I/O is released and the pod can be reaped"
+        local dead_devices=($(get_v2_devices))
+        for device in "${dead_devices[@]}"; do
+            if timeout 10 dmsetup remove --force "$device"; then
+                log "Force-removed stale device-mapper device: $device"
+            else
+                log "Failed to force-remove device-mapper device (relying on SIGKILL): $device"
+            fi
+            rm -f "/host/dev/longhorn/$device"
+        done
         return
     fi
 
