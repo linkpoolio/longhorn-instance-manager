@@ -160,6 +160,8 @@ github.com/linkpoolio/longhorn-spdk-engine v0.0.0-20260618153321-43eadeec07c0 h1
 github.com/linkpoolio/longhorn-spdk-engine v0.0.0-20260618153321-43eadeec07c0/go.mod h1:68QfLRJT3LupCPTzh9VEyOuTZrnxcwz/l7YlMwmVxMk=
 github.com/linkpoolio/longhorn-spdk-engine v0.0.0-20260620190551-d37b40bafc5a h1:V8lhGbTdpCXw7yQHzhsgq4AfjpoOocKqqcywWnnM0jA=
 github.com/linkpoolio/longhorn-spdk-engine v0.0.0-20260620190551-d37b40bafc5a/go.mod h1:68QfLRJT3LupCPTzh9VEyOuTZrnxcwz/l7YlMwmVxMk=
+github.com/linkpoolio/longhorn-spdk-engine v0.0.0-20260620205934-1d8b6f2616aa h1:WOqgsMHYLQl0629kV59dDEW0EgI+07VYWJMjFtI8NT0=
+github.com/linkpoolio/longhorn-spdk-engine v0.0.0-20260620205934-1d8b6f2616aa/go.mod h1:68QfLRJT3LupCPTzh9VEyOuTZrnxcwz/l7YlMwmVxMk=
 github.com/linkpoolio/types v0.0.0-20260610091928-a08cb4ff0b7a h1:/9vz16MpHRBdu2InR4sl9QBtCEZH2T69zSsE5OGvCqc=
 github.com/linkpoolio/types v0.0.0-20260610091928-a08cb4ff0b7a/go.mod h1:F84Y4B+3GyEcjr9EbwdI3RgOzT8nm2EqHxqyTWkCfRE=
 github.com/longhorn/backupstore v0.0.0-20260525102750-1ed7dde50b68 h1:p05ShG/5GrcHLU0+ZejEogNONg99e6JS1hq9qXY0B8o=
