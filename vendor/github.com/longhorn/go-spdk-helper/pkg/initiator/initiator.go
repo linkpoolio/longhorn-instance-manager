@@ -55,6 +55,12 @@ const (
 
 	maxWaitDeviceRetries = 60
 	waitDeviceInterval   = 1 * time.Second
+
+	// staleControllerDisconnectTimeout bounds the pre-suspend disconnect of a stale
+	// NVMe/TCP path so a controller whose in-kernel teardown is wedged cannot stall
+	// the re-attach for the full ExecuteTimeout (180s). Best-effort: on timeout we
+	// log and fall through to the suspend/reload.
+	staleControllerDisconnectTimeout = 15 * time.Second
 )
 
 var (
@@ -488,8 +494,11 @@ func (i *Initiator) disconnectStaleNVMeTCPControllers() {
 	}
 	for _, path := range staleControllerPaths(subsystems, i.NVMeTCPInfo.SubsystemNQN, i.NVMeTCPInfo.TransportAddress, i.NVMeTCPInfo.TransportServiceID) {
 		i.logger.Warnf("Disconnecting stale NVMe/TCP controller %s (%s, state=%s) before dm suspend to avoid suspend-on-dead hang", path.Name, path.Address, path.State)
-		if err := disconnectController(path.Name, i.executor); err != nil {
-			i.logger.WithError(err).Warnf("Failed to disconnect stale NVMe/TCP controller %s", path.Name)
+		// Short, dedicated timeout: this runs on the re-attach path, so a controller
+		// whose in-kernel teardown is itself wedged must not stall it for the full
+		// ExecuteTimeout (180s). Best-effort; on timeout we log and proceed.
+		if err := disconnectControllerWithTimeout(path.Name, staleControllerDisconnectTimeout, i.executor); err != nil {
+			i.logger.WithError(err).Warnf("Failed to disconnect stale NVMe/TCP controller %s within %s", path.Name, staleControllerDisconnectTimeout)
 		}
 	}
 }
