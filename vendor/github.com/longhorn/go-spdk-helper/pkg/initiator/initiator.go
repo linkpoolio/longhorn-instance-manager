@@ -449,7 +449,58 @@ func (i *Initiator) resumeLinearDmDevice() error {
 	return util.DmsetupResume(i.Name, i.executor)
 }
 
+// staleControllerPaths returns the paths of subsystem nqn whose controller does NOT
+// match the good (goodIP, goodPort) path. These are stale NVMe/TCP paths left pointing
+// at a dead/old target (e.g. after the SPDK target moved on an instance-manager restart).
+// It is pure (no I/O) so the selection logic can be unit tested.
+func staleControllerPaths(subsystems []Subsystem, nqn, goodIP, goodPort string) []Path {
+	var stale []Path
+	for _, sys := range subsystems {
+		if sys.NQN != nqn {
+			continue
+		}
+		for _, path := range sys.Paths {
+			ip, port := GetIPAndPortFromControllerAddress(path.Address)
+			if ip == goodIP && port == goodPort {
+				continue // keep the freshly-connected good path
+			}
+			stale = append(stale, path)
+		}
+	}
+	return stale
+}
+
+// disconnectStaleNVMeTCPControllers disconnects any controller for this initiator's
+// subsystem whose path does not match the freshly-connected good path (i.NVMeTCPInfo).
+// A stale path still references a dead/old target; its in-flight I/O can never drain, so
+// a subsequent `dmsetup suspend` on the linear dm device backed by it blocks forever and
+// wedges the EngineFrontend (the suspend-on-dead hang). Disconnecting the stale path first
+// makes the kernel fail that I/O (EIO), letting the suspend/reload/resume target swap
+// complete. Best-effort: failures are logged, not fatal.
+func (i *Initiator) disconnectStaleNVMeTCPControllers() {
+	if i.NVMeTCPInfo == nil || i.NVMeTCPInfo.SubsystemNQN == "" {
+		return
+	}
+	subsystems, err := GetSubsystems(i.executor)
+	if err != nil {
+		i.logger.WithError(err).Warn("Failed to list subsystems while pruning stale NVMe/TCP controllers before dm suspend")
+		return
+	}
+	for _, path := range staleControllerPaths(subsystems, i.NVMeTCPInfo.SubsystemNQN, i.NVMeTCPInfo.TransportAddress, i.NVMeTCPInfo.TransportServiceID) {
+		i.logger.Warnf("Disconnecting stale NVMe/TCP controller %s (%s, state=%s) before dm suspend to avoid suspend-on-dead hang", path.Name, path.Address, path.State)
+		if err := disconnectController(path.Name, i.executor); err != nil {
+			i.logger.WithError(err).Warnf("Failed to disconnect stale NVMe/TCP controller %s", path.Name)
+		}
+	}
+}
+
 func (i *Initiator) replaceDmDeviceTarget() error {
+	// The linear dm device's current backing may still point at a stale NVMe/TCP path
+	// (e.g. the SPDK target moved after an instance-manager restart). Suspending it would
+	// block forever on in-flight I/O that can never drain on the dead path. Disconnect any
+	// stale controller first so the kernel fails that I/O and the suspend can complete.
+	i.disconnectStaleNVMeTCPControllers()
+
 	suspended, err := i.IsSuspended()
 	if err != nil {
 		return errors.Wrapf(err, "failed to check if linear dm device is suspended for initiator %s", i.Name)
