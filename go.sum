@@ -146,6 +146,8 @@ github.com/kr/text v0.2.0 h1:5Nx0Ya0ZqY2ygV366QzturHI13Jq95ApcVaJBhpS+AY=
 github.com/kr/text v0.2.0/go.mod h1:eLer722TekiGuMkidMxC/pM04lWEeraHUUmBw8l2grE=
 github.com/kylelemons/godebug v1.1.0 h1:RPNrshWIDI6G2gRW9EHilWtl7Z6Sb1BR0xunSBf0SNc=
 github.com/kylelemons/godebug v1.1.0/go.mod h1:9/0rRGxNHcop5bhtWyNeEfOS8JIWk580+fNqagV/RAw=
+github.com/linkpoolio/go-common-libs v0.0.0-20260623134507-fea5f2490080 h1:LOwjt60Vx1xzFDL/8hUicbzjexJLUpEMPWAdVcsTe+E=
+github.com/linkpoolio/go-common-libs v0.0.0-20260623134507-fea5f2490080/go.mod h1:+aXFI8DmHTX4Az9pZF16/XKfrVKWIESJjw+hcxdMslw=
 github.com/linkpoolio/go-spdk-helper v0.6.1-0.20260620153504-b6ea1c99a5ac h1:PrYw3ySZXyatMYk2uzdLPodJcssh7s5RUX+dP5QgjsY=
 github.com/linkpoolio/go-spdk-helper v0.6.1-0.20260620153504-b6ea1c99a5ac/go.mod h1:ZxbMkGsbC2TpzuGLjn9yXXExolt8/F3dl/C8O9/Qa7s=
 github.com/linkpoolio/longhorn-spdk-engine v0.0.0-20260621103829-7c5bc0ad5b04 h1:CEfYg6Eh62x2ufhOYbn6heQKnGgaORjSJw2JbN6glPM=
@@ -154,8 +156,6 @@ github.com/linkpoolio/types v0.0.0-20260610091928-a08cb4ff0b7a h1:/9vz16MpHRBdu2
 github.com/linkpoolio/types v0.0.0-20260610091928-a08cb4ff0b7a/go.mod h1:F84Y4B+3GyEcjr9EbwdI3RgOzT8nm2EqHxqyTWkCfRE=
 github.com/longhorn/backupstore v0.0.0-20260525102750-1ed7dde50b68 h1:p05ShG/5GrcHLU0+ZejEogNONg99e6JS1hq9qXY0B8o=
 github.com/longhorn/backupstore v0.0.0-20260525102750-1ed7dde50b68/go.mod h1:sJ3YQBK1exSY+Gep0cKaQhZ9f2rOem2hy6NTOk7iFg8=
-github.com/longhorn/go-common-libs v0.0.0-20260525102658-c0739cd3e2c2 h1:2xTjL2HGPW1/pV7DG7a/0IRbnksf5e0SLlrLrNE24ig=
-github.com/longhorn/go-common-libs v0.0.0-20260525102658-c0739cd3e2c2/go.mod h1:6dyqqzjGfiPBn0OTKZcTBOjyViexE/L2D56741sch5s=
 github.com/longhorn/go-iscsi-helper v0.0.0-20260331100542-4c4c6f91525b h1:877AlP/bMchRs0qRHVW3zZ42qt+iNjALc4Sz9XzrgZQ=
 github.com/longhorn/go-iscsi-helper v0.0.0-20260331100542-4c4c6f91525b/go.mod h1:5obSKdWNPiFbFTzPWU09k9mGCSnpN9pgGoHQTUk7kYo=
 github.com/longhorn/longhorn-engine v1.12.0-dev-20260503.0.20260514055128-ec3f7dbb512f h1:R76xekZfQKZTJrWs74QD4YLhXTiGEEUJr5aEjKGoh3k=
