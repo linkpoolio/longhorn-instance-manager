@@ -2,6 +2,7 @@ package initiator
 
 import (
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -55,6 +56,12 @@ const (
 
 	maxWaitDeviceRetries = 60
 	waitDeviceInterval   = 1 * time.Second
+
+	// staleControllerDisconnectTimeout bounds the pre-suspend disconnect of a stale
+	// NVMe/TCP path so a controller whose in-kernel teardown is wedged cannot stall
+	// the re-attach for the full ExecuteTimeout (180s). Best-effort: on timeout we
+	// log and fall through to the suspend/reload.
+	staleControllerDisconnectTimeout = 15 * time.Second
 )
 
 var (
@@ -92,6 +99,12 @@ type NVMeTCPInfo struct {
 	TransportServiceID string
 	ControllerName     string
 	NamespaceName      string
+
+	// Transport is the NVMe-oF transport for this initiator connection.
+	// Empty string means TCP (legacy behavior). Set to "rdma" to use
+	// NVMe-oF RDMA. The name NVMeTCPInfo is retained for backward
+	// compatibility with callers that predate RDMA support.
+	Transport string
 }
 
 type UblkInfo struct {
@@ -182,7 +195,17 @@ func (lock *initiatorLock) Unlock() {
 	lock.lock.Unlock()
 }
 
-// DiscoverNVMeTCPTarget discovers a target
+// transport returns the NVMe-oF transport configured on NVMeTCPInfo, falling
+// back to DefaultTransportType (TCP) when the info or the field is unset.
+func (i *Initiator) transport() string {
+	if i.NVMeTCPInfo != nil && i.NVMeTCPInfo.Transport != "" {
+		return i.NVMeTCPInfo.Transport
+	}
+	return DefaultTransportType
+}
+
+// DiscoverNVMeTCPTarget discovers a target over the transport configured on
+// NVMeTCPInfo (TCP when unset).
 func (i *Initiator) DiscoverNVMeTCPTarget(ip, port string) (string, error) {
 	if i.hostProc != "" {
 		lock, err := i.newLock("DiscoverNVMeTCPTarget")
@@ -192,10 +215,11 @@ func (i *Initiator) DiscoverNVMeTCPTarget(ip, port string) (string, error) {
 		defer lock.Unlock()
 	}
 
-	return DiscoverTarget(ip, port, i.executor)
+	return DiscoverTargetWithTransport(i.transport(), ip, port, i.executor)
 }
 
-// ConnectNVMeTCPTarget connects to a target
+// ConnectNVMeTCPTarget connects to a target over the transport configured on
+// NVMeTCPInfo (TCP when unset).
 func (i *Initiator) ConnectNVMeTCPTarget(ip, port, nqn string) (string, error) {
 	if i.hostProc != "" {
 		lock, err := i.newLock("ConnectNVMeTCPTarget")
@@ -205,7 +229,7 @@ func (i *Initiator) ConnectNVMeTCPTarget(ip, port, nqn string) (string, error) {
 		defer lock.Unlock()
 	}
 
-	return ConnectTarget(ip, port, nqn, i.executor)
+	return ConnectTargetWithTransport(i.transport(), ip, port, nqn, i.executor)
 }
 
 // executeNVMeTCPPathOp validates initiator state, acquires the file lock, and
@@ -432,14 +456,87 @@ func (i *Initiator) resumeLinearDmDevice() error {
 	return util.DmsetupResume(i.Name, i.executor)
 }
 
-func (i *Initiator) replaceDmDeviceTarget() error {
-	deferredRemove, err := i.IsDeferredRemoveSet()
+// staleControllerPaths returns the paths of subsystem nqn whose controller does NOT
+// match the good (goodIP, goodPort) path. These are stale NVMe/TCP paths left pointing
+// at a dead/old target (e.g. after the SPDK target moved on an instance-manager restart).
+// It is pure (no I/O) so the selection logic can be unit tested.
+func staleControllerPaths(subsystems []Subsystem, nqn, goodIP, goodPort string) []Path {
+	var stale []Path
+	for _, sys := range subsystems {
+		if sys.NQN != nqn {
+			continue
+		}
+		for _, path := range sys.Paths {
+			ip, port := GetIPAndPortFromControllerAddress(path.Address)
+			if ip == goodIP && port == goodPort {
+				continue // keep the freshly-connected good path
+			}
+			stale = append(stale, path)
+		}
+	}
+	return stale
+}
+
+// disconnectStaleNVMeTCPControllers disconnects any controller for this initiator's
+// subsystem whose path does not match the freshly-connected good path (i.NVMeTCPInfo).
+// A stale path still references a dead/old target; its in-flight I/O can never drain, so
+// a subsequent `dmsetup suspend` on the linear dm device backed by it blocks forever and
+// wedges the EngineFrontend (the suspend-on-dead hang). Disconnecting the stale path first
+// makes the kernel fail that I/O (EIO), letting the suspend/reload/resume target swap
+// complete. Best-effort: failures are logged, not fatal.
+func (i *Initiator) disconnectStaleNVMeTCPControllers() {
+	if i.NVMeTCPInfo == nil || i.NVMeTCPInfo.SubsystemNQN == "" {
+		return
+	}
+	subsystems, err := GetSubsystems(i.executor)
 	if err != nil {
-		return errors.Wrapf(err, "failed to check if linear dm device has deferred-remove flag set for initiator %s", i.Name)
+		i.logger.WithError(err).Warn("Failed to list subsystems while pruning stale NVMe/TCP controllers before dm suspend")
+		return
 	}
-	if deferredRemove {
-		i.logger.Warn("Trying to reuse the linear dm device that has deferred-remove flag set, the device will be removed after not busy")
+	for _, path := range staleControllerPaths(subsystems, i.NVMeTCPInfo.SubsystemNQN, i.NVMeTCPInfo.TransportAddress, i.NVMeTCPInfo.TransportServiceID) {
+		i.logger.Warnf("Disconnecting stale NVMe/TCP controller %s (%s, state=%s) before dm suspend to avoid suspend-on-dead hang", path.Name, path.Address, path.State)
+		// Short, dedicated timeout: this runs on the re-attach path, so a controller
+		// whose in-kernel teardown is itself wedged must not stall it for the full
+		// ExecuteTimeout (180s). Best-effort; on timeout we log and proceed.
+		if err := disconnectControllerWithTimeout(path.Name, staleControllerDisconnectTimeout, i.executor); err != nil {
+			i.logger.WithError(err).Warnf("Failed to disconnect stale NVMe/TCP controller %s within %s", path.Name, staleControllerDisconnectTimeout)
+		}
 	}
+}
+
+// dmLinearDeviceDead probes the dm-linear device at devPath and reports whether
+// it is confirmed dead: a non-blocking open returns ENXIO (the dm table is
+// gone) or the first read returns EIO/ENXIO (the backing NVMe namespace is
+// gone). It is deliberately conservative — returns false (NOT dead) for a
+// missing path, a non-device, or any ambiguous error — so a healthy or merely
+// busy device always takes the safe suspend path.
+//
+// This mirrors longhorn-spdk-engine's suspendDeviceConfirmedDead, but is local
+// to the initiator because replaceDmDeviceTarget's suspend path was not covered
+// by the engine's Suspend() probe.
+func dmLinearDeviceDead(devPath string) bool {
+	statInfo, err := os.Stat(devPath)
+	if err != nil || statInfo.Mode()&os.ModeDevice == 0 {
+		return false
+	}
+	f, err := os.OpenFile(devPath, os.O_RDONLY|unix.O_NONBLOCK, 0)
+	if err != nil {
+		return errors.Is(err, unix.ENXIO) || errors.Is(err, unix.EIO)
+	}
+	defer func() { _ = f.Close() }()
+	buf := make([]byte, 1)
+	if _, err := f.Read(buf); err != nil && !errors.Is(err, io.EOF) {
+		return errors.Is(err, unix.EIO) || errors.Is(err, unix.ENXIO)
+	}
+	return false
+}
+
+func (i *Initiator) replaceDmDeviceTarget() error {
+	// The linear dm device's current backing may still point at a stale NVMe/TCP path
+	// (e.g. the SPDK target moved after an instance-manager restart). Suspending it would
+	// block forever on in-flight I/O that can never drain on the dead path. Disconnect any
+	// stale controller first so the kernel fails that I/O and the suspend can complete.
+	i.disconnectStaleNVMeTCPControllers()
 
 	suspended, err := i.IsSuspended()
 	if err != nil {
@@ -447,6 +544,18 @@ func (i *Initiator) replaceDmDeviceTarget() error {
 	}
 
 	if !suspended {
+		// A dmsetup suspend on a dead dm-linear (backing NVMe namespace gone
+		// after an instance-manager restart) wedges forever in D-state:
+		// dm_suspend waits for in-flight I/O to drain, and I/O to a dead
+		// backing can never complete. --noflush does NOT avoid this: dm_suspend
+		// still waits on already-dispatched I/O. Probe the device; if confirmed
+		// dead, skip the suspend+reload+resume entirely and return an error so
+		// the EF observer heal path recreates the dm-linear from scratch (which
+		// uses non-blocking deferred removal, not suspend).
+		if dmLinearDeviceDead(i.Endpoint) {
+			i.logger.Warnf("Skipping dm target replace for %s: backing device %s confirmed dead; a suspend would wedge in D-state", i.Name, i.Endpoint)
+			return errors.Errorf("dm-linear device %s confirmed dead; skipping suspend to avoid D-state wedge", i.Endpoint)
+		}
 		if err := i.suspendLinearDmDevice(true, false); err != nil {
 			return errors.Wrapf(err, "failed to suspend linear dm device for initiator %s", i.Name)
 		}
@@ -527,13 +636,37 @@ func (i *Initiator) StartNvmeTCPInitiator(transportAddress, transportServiceID s
 
 	if dmDeviceAndEndpointCleanupRequired {
 		if dmDeviceIsBusy {
-			// Endpoint is already created, just replace the target device
-			i.logger.Info("Linear dm device is busy, trying the best to replace the target device for NVMe/TCP initiator")
-			if err := i.replaceDmDeviceTarget(); err != nil {
-				i.logger.WithError(err).Warnf("Failed to replace the target device for NVMe/TCP initiator")
+			// The dm-linear exists but is busy (typically held open by a stale
+			// kubelet mount from a force-deleted pod). replaceDmDeviceTarget
+			// would suspend the device to reload the target, but dm_suspend
+			// hangs when the device is busy (it waits for in-flight I/O to
+			// quiesce, which can't complete while a stale mount holds it open)
+			// — wedging the dmsetup process in uninterruptible D-state.
+			//
+			// Instead, force-remove the device: dmsetup remove --force swaps in
+			// the error target, EIOing all in-flight I/O and releasing the
+			// stale mount. Then create a fresh dm-linear pointing at the new
+			// NVMe namespace. The force-remove is bounded at 10s (not
+			// ExecuteTimeout) so a truly stuck device doesn't hang for 3 min.
+			i.logger.Info("Linear dm device is busy, force-removing and recreating for NVMe/TCP initiator")
+			if err := util.DmsetupRemoveWithTimeout(i.Name, true /*force*/, false, i.executor, 10*time.Second); err != nil {
+				// Force-remove failed (truly wedged). Fall back to the probe
+				// + suspend path as a last resort — if the device is dead the
+				// probe will skip the suspend; if alive the suspend may still
+				// wedge but we've exhausted the clean options.
+				i.logger.WithError(err).Warnf("Force-remove of busy dm-linear failed; falling back to replace target device")
+				if err := i.replaceDmDeviceTarget(); err != nil {
+					i.logger.WithError(err).Warnf("Failed to replace the target device for NVMe/TCP initiator")
+				} else {
+					dmDeviceIsBusy = false
+				}
 			} else {
-				i.logger.Info("Successfully replaced the target device for NVMe/TCP initiator")
+				// Force-remove succeeded; create a fresh dm-linear.
 				dmDeviceIsBusy = false
+				i.logger.Info("Creating linear dm device for NVMe/TCP initiator after force-removing busy device")
+				if err := i.createLinearDmDevice(); err != nil {
+					return false, errors.Wrapf(err, "failed to create linear dm device for NVMe/TCP initiator %s after force-remove", i.Name)
+				}
 			}
 		} else {
 			i.logger.Info("Creating linear dm device for NVMe/TCP initiator")
@@ -856,20 +989,21 @@ func (i *Initiator) discoverAndConnectNVMeTCPTarget(transportAddress, transportS
 			// This avoids "failed to add controller" errors from nvme-cli 2.x
 			// when the kernel already has NVMe-oF connections to the same
 			// target address with the same hostNQN/hostID.
+			transport := i.transport()
 			if i.NVMeTCPInfo.SubsystemNQN != "" {
 				subsystemNQN = i.NVMeTCPInfo.SubsystemNQN
-				i.logger.Infof("Using pre-configured SubsystemNQN %s for target %s:%s, skipping discovery",
-					subsystemNQN, transportAddress, transportServiceID)
+				i.logger.Infof("Using pre-configured SubsystemNQN %s for target %s:%s (transport=%s), skipping discovery",
+					subsystemNQN, transportAddress, transportServiceID, transport)
 			} else {
-				i.logger.Infof("Discovering NVMe/TCP target %s:%s", transportAddress, transportServiceID)
-				subsystemNQN, e = DiscoverTarget(transportAddress, transportServiceID, i.executor)
+				i.logger.Infof("Discovering NVMe-oF target %s:%s (transport=%s)", transportAddress, transportServiceID, transport)
+				subsystemNQN, e = DiscoverTargetWithTransport(transport, transportAddress, transportServiceID, i.executor)
 				if e != nil {
-					return errors.Wrapf(e, "discover NVMe/TCP target %s:%s failed", transportAddress, transportServiceID)
+					return errors.Wrapf(e, "discover NVMe-oF target %s:%s (transport=%s) failed", transportAddress, transportServiceID, transport)
 				}
 			}
 
-			i.logger.Infof("Connecting to NVMe/TCP target %s:%s with subsystemNQN %s", transportAddress, transportServiceID, subsystemNQN)
-			controllerName, e = ConnectTarget(transportAddress, transportServiceID, subsystemNQN, i.executor)
+			i.logger.Infof("Connecting to NVMe-oF target %s:%s with subsystemNQN %s (transport=%s)", transportAddress, transportServiceID, subsystemNQN, transport)
+			controllerName, e = ConnectTargetWithTransport(transport, transportAddress, transportServiceID, subsystemNQN, i.executor)
 			if e != nil {
 				// "already connected" means the path is present in the kernel
 				// but GetDevices() couldn't find a namespace device yet (e.g.
@@ -1046,6 +1180,40 @@ func (i *Initiator) GetEndpoint() string {
 		return i.Endpoint
 	}
 	return ""
+}
+
+// GetExecutor exposes the underlying namespace executor so callers that
+// already hold an Initiator can reuse its nsenter setup for nvme-cli
+// operations without constructing a new one. Needed by transport-specific
+// teardown paths (e.g. explicit RDMA controller disconnect during
+// switchover).
+//
+// Concurrency contract: anything run through the returned executor bypasses
+// the per-volume file lock that Initiator methods take. Callers must not use
+// it concurrently with other Initiator operations on the same volume; prefer
+// a locked convenience method (e.g. DisconnectNVMeController) where one
+// exists.
+func (i *Initiator) GetExecutor() *commonns.Executor {
+	return i.executor
+}
+
+// DisconnectNVMeController disconnects the single NVMe controller matching
+// the given NQN, IP, and port while holding the per-volume file lock. It is
+// the locked equivalent of DisconnectController(nqn, ip, port, GetExecutor())
+// and should be preferred by teardown paths (e.g. explicit RDMA controller
+// disconnect during switchover) so they cannot race other Initiator
+// operations on the same volume. Returns nil when no matching controller is
+// found (already disconnected).
+func (i *Initiator) DisconnectNVMeController(nqn, ip, port string) error {
+	if i.hostProc != "" {
+		lock, err := i.newLock("DisconnectNVMeController")
+		if err != nil {
+			return err
+		}
+		defer lock.Unlock()
+	}
+
+	return DisconnectController(nqn, ip, port, i.executor)
 }
 
 // WaitForControllerLive waits for the NVMe controller at the given address to
@@ -1277,11 +1445,32 @@ func (i *Initiator) removeEndpoint() error {
 func (i *Initiator) removeLinearDmDevice(force, deferred bool) error {
 	dmDevPath := getDmDevicePath(i.Name)
 	if _, err := os.Stat(dmDevPath); err != nil {
+		if os.IsNotExist(err) {
+			// Already removed -- the goal state of this function.
+			return nil
+		}
 		return err
 	}
 
 	i.logger.Info("Removing linear dm device")
-	return util.DmsetupRemove(i.Name, force, deferred, i.executor)
+	if err := util.DmsetupRemove(i.Name, force, deferred, i.executor); err != nil {
+		// A crash can leave a stale /dev/mapper node behind without a
+		// backing dm device; the remove ioctl then fails with ENXIO ("No
+		// such device or address"). Treating that as fatal wedges every
+		// initiator restart on the volume (observed as engine frontends
+		// flapping forever after an spdk_tgt crash). The device is
+		// already gone: clean up the stale node and succeed.
+		if dmsetupRemoveErrIsAlreadyGone(err) {
+			i.logger.WithError(err).Warn("dm device already gone; removing stale device node")
+			if rmErr := os.Remove(dmDevPath); rmErr != nil && !os.IsNotExist(rmErr) {
+				return errors.Wrapf(rmErr, "failed to remove stale dm device node %s", dmDevPath)
+			}
+			return nil
+		}
+		return err
+	}
+
+	return nil
 }
 
 func (i *Initiator) createLinearDmDevice() error {
@@ -1442,21 +1631,6 @@ func (i *Initiator) IsSuspended() (bool, error) {
 	return false, fmt.Errorf("failed to find linear dm device %s", i.Name)
 }
 
-// IsDeferredRemoveSet checks if the linear dm device has the deferred-remove flag set
-func (i *Initiator) IsDeferredRemoveSet() (bool, error) {
-	devices, err := util.DmsetupInfo(i.Name, i.executor)
-	if err != nil {
-		return false, err
-	}
-
-	for _, device := range devices {
-		if device.Name == i.Name {
-			return device.DeferredRemove, nil
-		}
-	}
-	return false, fmt.Errorf("failed to find linear dm device %s", i.Name)
-}
-
 func (i *Initiator) reloadLinearDmDevice() error {
 	devPath := fmt.Sprintf("/dev/%s", i.dev.Source.Name)
 
@@ -1498,4 +1672,12 @@ func (i *Initiator) reloadLinearDmDevice() error {
 
 func getDmDevicePath(name string) string {
 	return filepath.Join("/dev/mapper", name)
+}
+
+// dmsetupRemoveErrIsAlreadyGone reports whether a dmsetup remove failure means
+// the dm device no longer exists (ENXIO from the remove ioctl) -- e.g. a crash
+// left a stale /dev/mapper node behind without a backing device. That state is
+// the removal's goal and must not be treated as fatal.
+func dmsetupRemoveErrIsAlreadyGone(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "No such device")
 }
