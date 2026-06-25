@@ -45,14 +45,53 @@ function generate_nvme_hostid_and_hostnqn() {
 
 function enable_spdk_tgt() {
     local options=("$@")
+    # Containerd spawns privileged containers with RLIMIT_MEMLOCK hard=8 MiB.
+    # SPDK pins hugepage ranges as RDMA Memory Regions; with an 8 MiB cap it
+    # can only register a sliver of the --mem-size pool and every IO whose
+    # buffer lands outside the window serializes through a bounce buffer,
+    # observed as ~400 ms per 128 KiB op on RDMA. The privileged container
+    # already holds CAP_SYS_RESOURCE, so prlimit on our own shell raises the
+    # hard cap to unlimited; spdk_tgt inherits it.
+    prlimit --pid $$ --memlock=unlimited:unlimited 2>/dev/null || true
+    # Crash forensics: spdk_tgt has died by unhandled signal with no output
+    # under mass TCP reconnect storms (suspected nvme_tcp teardown
+    # use-after-free). The node's kernel.core_pattern is the plain relative
+    # "core", so a dump lands in the process cwd -- launch from /log (the
+    # hostPath that survives pod replacement) instead of /, and pin the core
+    # rlimit so a backtrace is available the next time it dies. Hugepage
+    # ranges are excluded from dumps by the default coredump_filter, so the
+    # core stays heap+stacks sized.
+    prlimit --pid $$ --core=unlimited:unlimited 2>/dev/null || true
+    # --wait-for-rpc keeps spdk_tgt paused before subsystem initialisation so
+    # that the Go side can call iobuf_set_options / bdev_nvme_set_options /
+    # nvmf_create_transport with tuned opts; then it drives framework_start_init
+    # to complete boot. Without this the default iobuf pools (large=1024,
+    # small=8192) lock in before we can grow them and any tuned transport
+    # opts exceed the pool, failing accel/bdev channel creation with -ENOMEM.
+    options+=("--wait-for-rpc")
     echo "Enabling spdk_tgt with options: ${options[*]}"
-    spdk_tgt "${options[@]}" 2>&1 | tee -a /log/spdk_tgt.log &
+    spdk_log_fifo=$(mktemp -u /tmp/longhorn-spdk-log.XXXXXX)
+    mkfifo "$spdk_log_fifo"
+    tee -a /log/spdk_tgt.log < "$spdk_log_fifo" &
+    spdk_log_tee_pid=$!
+    (
+        cd /log || exit 1
+        exec spdk_tgt "${options[@]}"
+    ) > "$spdk_log_fifo" 2>&1 &
+    spdk_tgt_pid=$!
+    mkdir -p "$(dirname "$spdk_tgt_pid_file")"
+    echo "$spdk_tgt_pid" > "$spdk_tgt_pid_file"
 
     timeout=120  # Timeout in seconds
     interval=1  # Interval in seconds
     elapsed_time=0
 
     while [ $elapsed_time -lt $timeout ]; do
+        if ! spdk_tgt_is_running "$spdk_tgt_pid"; then
+            echo "spdk_tgt exited before socket file '/var/tmp/spdk.sock' was created."
+            return 1
+        fi
+
         if [ -S "/var/tmp/spdk.sock" ]; then
             echo "Socket file '/var/tmp/spdk.sock' found after $elapsed_time seconds."
             return 0  # Exit successfully if the file exists
@@ -66,9 +105,84 @@ function enable_spdk_tgt() {
     return 1
 }
 
+function process_is_running() {
+    local pid="$1"
+    local stat
+    local state
+
+    [[ -n "$pid" ]] || return 1
+    kill -0 "$pid" >/dev/null 2>&1 || return 1
+
+    stat=$(<"/proc/$pid/stat") || return 1
+    state="${stat#*) }"
+    state="${state%% *}"
+    [[ "$state" != "Z" ]]
+}
+
+function process_argv0_is() {
+    local pid="$1"
+    local expected="$2"
+    local argv0
+
+    [[ -r "/proc/$pid/cmdline" ]] || return 1
+    IFS= read -r -d '' argv0 < "/proc/$pid/cmdline" || true
+    argv0="${argv0##*/}"
+    [[ "$argv0" == "$expected" ]]
+}
+
+function spdk_tgt_is_running() {
+    local pid="$1"
+
+    process_is_running "$pid" && process_argv0_is "$pid" "spdk_tgt"
+}
+
+function wait_if_exited() {
+    local pid="$1"
+
+    [[ -n "$pid" ]] || return 0
+    if ! process_is_running "$pid"; then
+        wait "$pid" >/dev/null 2>&1 || true
+    fi
+}
+
+function forward_signal() {
+    local signal="$1"
+
+    if [[ -n "${instance_manager_pid:-}" ]] && kill -0 "$instance_manager_pid" >/dev/null 2>&1; then
+        echo "Forwarding $signal to longhorn-instance-manager"
+        kill "-$signal" "$instance_manager_pid" >/dev/null 2>&1 || true
+    fi
+}
+
+function cleanup_spdk_tgt() {
+    if spdk_tgt_is_running "${spdk_tgt_pid:-}"; then
+        kill -TERM "$spdk_tgt_pid" >/dev/null 2>&1 || true
+        sleep 1
+        if spdk_tgt_is_running "$spdk_tgt_pid"; then
+            kill -KILL "$spdk_tgt_pid" >/dev/null 2>&1 || true
+        fi
+    fi
+    wait_if_exited "${spdk_tgt_pid:-}"
+    if spdk_tgt_is_running "${spdk_tgt_pid:-}"; then
+        echo "spdk_tgt pid $spdk_tgt_pid still running after SIGKILL; not blocking wrapper exit"
+    fi
+    rm -f "${spdk_tgt_pid_file:-}"
+
+    if process_is_running "${spdk_log_tee_pid:-}"; then
+        kill "${spdk_log_tee_pid:-}" >/dev/null 2>&1 || true
+    fi
+    wait_if_exited "${spdk_log_tee_pid:-}"
+    rm -f "${spdk_log_fifo:-}"
+}
+
 enable_spdk=0
 spdk_options=()
 instance_manager_options=()
+instance_manager_pid=""
+spdk_tgt_pid=""
+spdk_tgt_pid_file="/var/run/longhorn-spdk-tgt.pid"
+spdk_log_fifo=""
+spdk_log_tee_pid=""
 
 while [[ $# -gt 0 ]]; do
     opt="$1"
@@ -78,6 +192,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         -m|--spdk-cpumask)
             spdk_options+=("-m" "$2")
+            # Export so the IM Go process can derive accel_mlx5 num_requests
+            # from the actual SPDK core count (not runtime.NumCPU(), which
+            # returns the pod's cgroup-visible CPUs and can mismatch).
+            export LONGHORN_V2_SPDK_CPUMASK="$2"
             shift
             ;;
         -s|--spdk-memory-size)
@@ -117,11 +235,63 @@ bind_sys
 bind_lib_modules
 [ "$enable_spdk" -eq 0 ] && enable_tgtd
 [ "$enable_spdk" -eq 1 ] && generate_nvme_hostid_and_hostnqn
-[ "$enable_spdk" -eq 1 ] && enable_spdk_tgt "${spdk_options[@]}"
+if [ "$enable_spdk" -eq 1 ]; then
+    if ! enable_spdk_tgt "${spdk_options[@]}"; then
+        cleanup_spdk_tgt
+        exit 1
+    fi
+fi
 
 if [ "$enable_spdk" -eq 1 ]; then
     exec-logrotate
-    exec longhorn-instance-manager "${instance_manager_options[@]}" 2>&1 | tee -a /log/instance-manager-${DATA_ENGINE}.log
+    trap 'forward_signal TERM' TERM
+    trap 'forward_signal INT' INT
+
+    log_fifo=$(mktemp -u /tmp/longhorn-instance-manager-log.XXXXXX)
+    mkfifo "$log_fifo"
+    tee -a /log/instance-manager-${DATA_ENGINE}.log < "$log_fifo" &
+    log_tee_pid=$!
+
+    longhorn-instance-manager "${instance_manager_options[@]}" > "$log_fifo" 2>&1 &
+    instance_manager_pid=$!
+    spdk_watchdog_fired=0
+
+    while process_is_running "$instance_manager_pid"; do
+        if ! spdk_tgt_is_running "$spdk_tgt_pid"; then
+            spdk_watchdog_fired=1
+            break
+        fi
+        sleep 1
+    done
+
+    if [[ "$spdk_watchdog_fired" -eq 1 ]]; then
+        echo "spdk_tgt is not running; forcing instance-manager wrapper to exit"
+        echo "SPDK watchdog fired; exiting instance-manager wrapper with failure"
+        kill -TERM "$instance_manager_pid" >/dev/null 2>&1 || true
+        sleep 1
+        if process_is_running "$instance_manager_pid"; then
+            kill -KILL "$instance_manager_pid" >/dev/null 2>&1 || true
+        fi
+        wait_if_exited "$instance_manager_pid"
+        if process_is_running "$instance_manager_pid"; then
+            echo "longhorn-instance-manager pid $instance_manager_pid still running after SIGKILL; not blocking wrapper exit"
+        fi
+
+        if process_is_running "${log_tee_pid:-}"; then
+            kill "$log_tee_pid" >/dev/null 2>&1 || true
+        fi
+        wait_if_exited "${log_tee_pid:-}"
+        cleanup_spdk_tgt
+        rm -f "$log_fifo"
+        exit 200
+    fi
+
+    cleanup_spdk_tgt
+    wait "$instance_manager_pid" >/dev/null 2>&1
+    instance_manager_status=$?
+    wait "$log_tee_pid" >/dev/null 2>&1 || true
+    rm -f "$log_fifo"
+    exit "$instance_manager_status"
 else
     exec longhorn-instance-manager "${instance_manager_options[@]}"
 fi

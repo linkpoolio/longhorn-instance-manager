@@ -1,39 +1,244 @@
 #!/bin/bash
 
+# kubelet runs PreStop as an exec against the container with its own
+# stdout/stderr — log shippers typically only tail the container's PID 1
+# stdout (/var/log/pods/<pod>/<ctr>/0.log). Redirect this script's output
+# to PID 1's fd 1 so the graceful-shutdown trace joins the container's
+# main log stream rather than being lost when the pod terminates.
+# Guard the redirect: if PID 1's fd 1 isn't writable (e.g. unusual runtime
+# sandboxing), a failed exec would abort the whole script and skip the
+# graceful shutdown below — better to lose the logs than the drain.
+if [ -w /proc/1/fd/1 ]; then
+    exec >> /proc/1/fd/1 2>&1
+fi
+
 log() {
-    echo "$(date '+%Y-%m-%d %H:%M:%S.%N') $*"
+    echo "[prestop] $(date -u '+%Y-%m-%dT%H:%M:%S.%NZ') $*"
+}
+
+SPDK_TGT_PID_FILE="/var/run/longhorn-spdk-tgt.pid"
+
+process_is_running() {
+    local pid="$1"
+    local stat
+    local state
+
+    [[ -n "$pid" ]] || return 1
+    kill -0 "$pid" >/dev/null 2>&1 || return 1
+
+    stat=$(<"/proc/$pid/stat") || return 1
+    state="${stat#*) }"
+    state="${state%% *}"
+    [[ "$state" != "Z" ]]
+}
+
+process_argv0_is() {
+    local pid="$1"
+    local expected="$2"
+    local argv0
+
+    [[ -r "/proc/$pid/cmdline" ]] || return 1
+    IFS= read -r -d '' argv0 < "/proc/$pid/cmdline" || true
+    argv0="${argv0##*/}"
+    [[ "$argv0" == "$expected" ]]
+}
+
+spdk_tgt_pid_is_running() {
+    local pid="$1"
+
+    process_is_running "$pid" && process_argv0_is "$pid" "spdk_tgt"
+}
+
+get_spdk_tgt_pids() {
+    local pid
+    local proc
+
+    if [[ -r "$SPDK_TGT_PID_FILE" ]]; then
+        read -r pid < "$SPDK_TGT_PID_FILE" || true
+        if spdk_tgt_pid_is_running "$pid"; then
+            echo "$pid"
+            return
+        fi
+    fi
+
+    for proc in /proc/[0-9]*; do
+        pid="${proc##*/}"
+        if spdk_tgt_pid_is_running "$pid"; then
+            echo "$pid"
+        fi
+    done
+}
+
+spdk_tgt_is_running() {
+    [[ -n "$(get_spdk_tgt_pids)" ]]
 }
 
 function cleanup_spdk_resources() {
     log "Caught termination signal. Cleaning up SPDK resources..."
 
+    # Do not use `pgrep -f spdk_tgt`: the log tee command contains
+    # "/log/spdk_tgt.log" in its argv and can falsely look like a live SPDK
+    # process after spdk_tgt has crashed. Use the PID written by the wrapper,
+    # with an exact argv[0] fallback scan for older pods.
+    if ! spdk_tgt_is_running; then
+        # spdk_tgt has already exited or crashed. Its NVMe-oF target is gone,
+        # so any dm device still mapping a /dev/longhorn volume onto that target
+        # has in-flight I/O parked in uninterruptible D-state. That wedged
+        # kernel I/O defeats the container's final SIGKILL, so the pod hangs in
+        # Terminating forever -- an un-reapable zombie the instance-manager
+        # controller cannot recreate, which is why a crashed spdk_tgt used to
+        # need a manual `kubectl delete --force`. Any workload still mounted on
+        # those devices stays blocked in D-state too.
+        #
+        # We cannot drain gracefully (the JSON-RPC socket died with spdk_tgt),
+        # and a plain `dmsetup remove` would itself block forever here: it
+        # suspends+flushes, waiting on the very I/O that can never complete.
+        # `dmsetup remove --force` instead swaps in the dm "error" target, which
+        # fails all outstanding and future I/O with EIO immediately -- releasing
+        # the D-state waiters so the device can be torn down, the container
+        # reaped, and the pod recreated with a fresh spdk_tgt. The workload sees
+        # I/O errors (recoverable when the volume reattaches) instead of an
+        # unbounded hang. Bound each call so a single uncooperative device can't
+        # re-hang PreStop.
+        log "spdk_tgt is not running (crashed/exited); force-failing stale dm devices so stuck I/O is released and the pod can be reaped"
+        local dead_devices=($(get_v2_devices))
+        for device in "${dead_devices[@]}"; do
+            if timeout 10 dmsetup remove --force "$device"; then
+                log "Force-removed stale device-mapper device: $device"
+            else
+                log "Failed to force-remove device-mapper device (relying on SIGKILL): $device"
+            fi
+            rm -f "/host/dev/longhorn/$device"
+        done
+        return
+    fi
+
+    local v2_devices=($(get_v2_devices))
+    for device in "${v2_devices[@]}"; do
+        # Bound dmsetup remove: a device still holding stuck I/O to a
+        # half-dead target can otherwise block forever and hang PreStop the
+        # same way a fully dead spdk_tgt would.
+        if timeout 10 dmsetup remove "$device"; then
+            log "Removed device-mapper device: $device"
+        else
+            log "Failed to remove device-mapper device (busy or timed out): $device"
+        fi
+
+        device_file="/host/dev/longhorn/$device"
+        if rm "$device_file"; then
+            log "Removed device file: $device_file"
+        else
+            log "Failed to remove device file: $device_file"
+        fi
+    done
+
+    # Drain NVMe-oF listeners BEFORE killing spdk_tgt. Removing each listener
+    # tells SPDK to send a clean RDMA/TCP disconnect frame to every connected
+    # initiator. Without this, peer bdev_nvme controllers see only an
+    # ungraceful transport drop and wedge in "failover already in progress"
+    # for ctrlr_loss_timeout, which on the peer side can starve its reactor
+    # and trip its own liveness probe. Best-effort: per-listener failures
+    # don't block kill-instance.
+    log "Draining NVMe-oF listeners so peer initiators see a clean disconnect..."
+    # Bound the RPC: if spdk_tgt is alive but wedged (unresponsive reactor),
+    # the drain call can hang. A timeout keeps PreStop moving to the kill.
+    if timeout 30 go-spdk-helper nvme-of drain-listeners; then
+        log "Drained NVMe-oF listeners successfully"
+    else
+        log "Failed to drain NVMe-oF listeners (continuing anyway)"
+    fi
+    # Brief settle so the NIC can flush the disconnect frames before the
+    # transport tears down with spdk_tgt's exit.
+    sleep 1
+
     log "Sending SIGTERM to go-spdk-helper to stop spdk_tgt..."
-    go-spdk-helper kill-instance --sig-name SIGTERM
+    timeout 30 go-spdk-helper kill-instance --sig-name SIGTERM
     if [[ $? -ne 0 ]]; then
         log "Failed to send SIGTERM to go-spdk-helper"
     else
         log "Successfully sent SIGTERM to go-spdk-helper"
     fi
 
-    local grace_period=60
-    local elapsed=0
-    while [[ $elapsed -lt $grace_period ]]; do
-        if ! pgrep -f "^spdk_tgt" > /dev/null 2>&1; then
-            log "spdk_tgt process has stopped"
+    # Wait for spdk_tgt to exit after SIGTERM. A healthy shutdown flushes its
+    # blobstore and exits within seconds, so this loop normally breaks almost
+    # immediately and the cap below never bites. The cap matters only for a
+    # *wedged* spdk_tgt -- e.g. one stuck tearing down NVMe-oF controllers that
+    # are themselves stuck in an infinite reconnect loop after a peer storage
+    # node was rebooted. Such a target never exits on its own; waiting out the
+    # old 270s cap left the pod in Terminating for minutes (an apparent zombie)
+    # until kubelet SIGKILLed it at terminationGracePeriodSeconds anyway.
+    #
+    # So: give it a bounded grace for a clean flush, then SIGKILL spdk_tgt
+    # ourselves and force-fail any dm device still mapping its now-dead target,
+    # so the pod is ALWAYS reaped promptly regardless of spdk_tgt's state. A
+    # wedged shutdown would have been SIGKILLed by kubelet at the 300s grace
+    # with the same un-flushed (dirty) blobstore, so killing at the bound here
+    # is never worse for on-disk state -- only faster to reap. The bound is
+    # tunable via SPDK_TGT_SHUTDOWN_GRACE_SEC (default 60s, well under the 300s
+    # pod grace and far above any healthy flush).
+    local grace_sec="${SPDK_TGT_SHUTDOWN_GRACE_SEC:-60}"
+    local deadline=$(( $(date +%s) + grace_sec ))
+    # Use the same exact process check as above. A log tee process must not keep
+    # PreStop waiting after the real spdk_tgt is gone.
+    while spdk_tgt_is_running; do
+        if [[ $(date +%s) -ge ${deadline} ]]; then
+            log "spdk_tgt did not exit within ${grace_sec}s of SIGTERM (wedged shutdown); escalating to SIGKILL so the pod is reaped now"
+            local pid
+            for pid in $(get_spdk_tgt_pids); do
+                if kill -9 "$pid" 2>/dev/null; then
+                    log "SIGKILLed wedged spdk_tgt pid ${pid}"
+                fi
+            done
+            # spdk_tgt's NVMe-oF target is now dead. Any dm device still mapping
+            # a /dev/longhorn volume onto it has in-flight I/O parked in D-state
+            # that would defeat the container's SIGKILL and re-zombie the pod.
+            # Force-fail them (dm "error" target) exactly like the crashed-spdk
+            # branch above, so stuck I/O is released and the pod can be reaped.
+            sleep 1
+            local device
+            local stale_devices=($(get_v2_devices))
+            for device in "${stale_devices[@]}"; do
+                if timeout 10 dmsetup remove --force "$device"; then
+                    log "Force-removed stale device-mapper device after SIGKILL: $device"
+                else
+                    log "Failed to force-remove device-mapper device after SIGKILL (relying on container SIGKILL): $device"
+                fi
+                rm -f "/host/dev/longhorn/$device"
+            done
             return
         fi
         sleep 1
-        elapsed=$((elapsed + 1))
-        log "Waiting for spdk_tgt to stop... (${elapsed}/${grace_period}s)"
+    done
+    log "spdk_tgt exited cleanly after SIGTERM"
+}
+
+function get_v2_devices() {
+    # dmsetup ls prints "name<TAB>(major:minor)" per device, but emits the
+    # literal string "No devices found" on stdout when the table is empty —
+    # filter to lines whose second field looks like a "(maj:min)" entry so
+    # that string is never treated as a device name.
+    local dm_devices
+    dm_devices=$(dmsetup ls 2>/dev/null | awk 'NF>1 && $2 ~ /^\(/ {print $1}')
+    local v2_devices=()
+
+    if [[ ! -d /host/dev/longhorn/ ]]; then
+        echo "${v2_devices[@]}"
+        return
+    fi
+
+    local device_files
+    device_files=$(ls /host/dev/longhorn/)
+
+    for dm_device in $dm_devices; do
+        for device_file in $device_files; do
+            if [[ "$dm_device" == "$device_file" ]]; then
+                v2_devices+=("$dm_device")
+                break
+            fi
+        done
     done
 
-    log "spdk_tgt did not stop within ${grace_period}s grace period, sending SIGKILL..."
-    pkill -KILL -f "^spdk_tgt"
-    if [[ $? -eq 0 ]]; then
-        log "Successfully sent SIGKILL to spdk_tgt"
-    else
-        log "Failed to send SIGKILL to spdk_tgt (process may have already exited)"
-    fi
+    echo "${v2_devices[@]}"
 }
 
 cleanup_spdk_resources

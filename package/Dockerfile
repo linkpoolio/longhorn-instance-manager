@@ -2,11 +2,10 @@
 FROM  registry.suse.com/bci/golang:1.26@sha256:2445a685ad302627a2c6b75f0915a37bc1277f2dc65572bad70723f78ca9dfb2 AS gobuilder
 
 ARG ARCH=amd64
-ARG SRC_BRANCH=master
+ARG SRC_BRANCH=v1.11.x-linkpool
 ARG SRC_TAG
 
-RUN zypper -n ref && \
-    zypper update -y
+RUN zypper -n ref
 
 RUN zypper -n install jq wget
 
@@ -15,7 +14,7 @@ ENV GOLANG_ARCH_amd64=amd64 GOLANG_ARCH_arm64=arm64 GOLANG_ARCH_s390x=s390x GOLA
 RUN go install golang.org/x/lint/golint@latest
 
 # If TAG is explicitly set and exists in the repo, switch to the tag
-RUN git clone https://github.com/longhorn/dep-versions.git -b ${SRC_BRANCH} /usr/src/dep-versions && \
+RUN git clone https://github.com/linkpoolio/dep-versions.git -b ${SRC_BRANCH} /usr/src/dep-versions && \
     cd /usr/src/dep-versions && \
     if [ -n "${SRC_TAG}" ] && git show-ref --tags ${SRC_TAG} > /dev/null 2>&1; then \
         echo "Checking out tag ${SRC_TAG}"; \
@@ -36,14 +35,13 @@ RUN export GRPC_HEALTH_PROBE_DOWNLOAD_URL=$(wget -qO- https://api.github.com/rep
 FROM registry.suse.com/bci/bci-base:15.7@sha256:dc0cdb596a8a4c04edd140a12351f5d8d24ab1818b22a898caf598aaa0e89ee9 AS cbuilder
 
 ARG ARCH=amd64
-ARG SRC_BRANCH=master
+ARG SRC_BRANCH=v1.11.x-linkpool
 ARG SRC_TAG
 
 # Install build dependencies from zypper
-RUN zypper -n ref && \
-    zypper update -y
+RUN zypper -n ref
 
-RUN zypper -n install cmake gcc gcc13 xsltproc docbook-xsl-stylesheets git python311 python311-pip fuse3-devel jq nasm
+RUN zypper -n install cmake gcc gcc13 xsltproc docbook-xsl-stylesheets git python311 python311-pip fuse3-devel jq nasm rdma-core-devel gettext-tools libtool
 
 RUN ln -sf /usr/bin/python3.11 /usr/local/bin/python && \
     ln -sf /usr/bin/python3.11 /usr/local/bin/python3 && \
@@ -51,7 +49,7 @@ RUN ln -sf /usr/bin/python3.11 /usr/local/bin/python && \
     ln -sf /usr/bin/pip3.11 /usr/local/bin/pip
 
 # Install dependencies defined in dep-versions
-RUN git clone https://github.com/longhorn/dep-versions.git -b ${SRC_BRANCH} /usr/src/dep-versions && \
+RUN git clone https://github.com/linkpoolio/dep-versions.git -b ${SRC_BRANCH} /usr/src/dep-versions && \
     cd /usr/src/dep-versions && \
     if [ -n "${SRC_TAG}" ] && git show-ref --tags ${SRC_TAG} > /dev/null 2>&1; then \
         echo "Checking out tag ${SRC_TAG}"; \
@@ -83,16 +81,22 @@ RUN export REPO_OVERRIDE="" && \
     export COMMIT_ID_OVERRIDE="" && \
     bash /usr/src/dep-versions/scripts/build-nvme-cli.sh "${REPO_OVERRIDE}" "${COMMIT_ID_OVERRIDE}"
 
+# Build libqcow (needed by longhorn-engine's qcow package via cgo). Upstream's
+# build flow expected the IM Go binary to be cross-compiled outside Docker, so
+# this wasn't in the cbuilder before; with the in-Docker build it is.
+RUN export REPO_OVERRIDE="" && \
+    export COMMIT_ID_OVERRIDE="" && \
+    bash /usr/src/dep-versions/scripts/build-libqcow.sh "${REPO_OVERRIDE}" "${COMMIT_ID_OVERRIDE}"
+
 # Stage 3: copy binaries to release image
 FROM registry.suse.com/bci/bci-base:15.7@sha256:dc0cdb596a8a4c04edd140a12351f5d8d24ab1818b22a898caf598aaa0e89ee9 AS release
 
 ARG ARCH=amd64
 
 ## Install runtime dependencies from zypper
-RUN zypper -n ref && \
-    zypper update -y
+RUN zypper -n ref
 
-RUN zypper -n install kmod jq util-linux procps awk qemu-tools e2fsprogs xfsprogs python311-base device-mapper netcat fuse3-devel logrotate libcmocka-devel
+RUN zypper -n install kmod jq util-linux procps awk qemu-tools e2fsprogs xfsprogs python311-base device-mapper netcat fuse3-devel logrotate libcmocka-devel rdma-core libibverbs librdmacm1
 
 RUN ln -sf /usr/bin/python3.11 /usr/local/bin/python && \
     ln -sf /usr/bin/python3.11 /usr/local/bin/python3
@@ -135,6 +139,12 @@ COPY --from=cbuilder \
    /usr/local/lib64 \
    /usr/local/lib64
 
+# libqcow.so lives under /usr/local/lib (autotools default), so the IM Go
+# binary (dynamically linked) needs it on the runtime ld path.
+COPY --from=cbuilder \
+   /usr/local/lib \
+   /usr/local/lib
+
 COPY --from=cbuilder \
    /usr/lib64 \
    /usr/lib64
@@ -144,13 +154,52 @@ RUN find /usr/lib64 -depth -type f -name 'wininst-*.exe' -exec rm -f {} \;
 
 RUN ldconfig
 
-COPY bin/longhorn-instance-manager /usr/local/bin/
+# Stage 4: build the longhorn-instance-manager Go binary using cbuilder libs/headers
+FROM gobuilder AS imbuilder
+
+ARG VERSION=dev
+
+RUN zypper -n install zlib-devel fuse3-devel gcc
+
+# Pull cbuilder's installed C libs/headers (liblonghorn, libjson-c, libqcow,
+# etc). libqcow's autotools install puts .so in /usr/local/lib, others go
+# to /usr/local/lib64 — copy both.
+COPY --from=cbuilder /usr/local/include /usr/local/include
+COPY --from=cbuilder /usr/local/lib /usr/local/lib
+COPY --from=cbuilder /usr/local/lib64 /usr/local/lib64
+RUN ldconfig
+
+ENV CGO_CFLAGS="-I/usr/local/include" \
+    CGO_LDFLAGS="-L/usr/local/lib64 -L/usr/local/lib"
+
+WORKDIR /src
+COPY . /src
+
+# Build hermetically from the vendor/ tree copied in with the source — no
+# module downloads, so linkpoolio pseudo-version pins don't need to be
+# network-fetchable at image build time.
+RUN go build -mod=vendor -o /usr/local/bin/longhorn-instance-manager \
+      -ldflags "-X main.Version=${VERSION}" \
+      .
+
+FROM release AS release-final
+
+COPY --from=imbuilder /usr/local/bin/longhorn-instance-manager /usr/local/bin/
 COPY package/instance-manager /usr/local/bin/
 COPY package/instance-manager-v2-prestop /usr/local/bin/
 COPY package/exec-logrotate /usr/local/bin/
 
 # Verify the dependencies for the binaries
 RUN ldd /usr/local/bin/* /usr/local/sbin/* /usr/sbin/* | grep "not found" && exit 1 || true
+
+# Verify spdk_tgt was built with RDMA transport support. zypper update during
+# the build is unpinned, so a rebuild can silently pick up a package set that
+# fails to provide librdmacm/libibverbs at configure time; SPDK then compiles
+# without the RDMA transport module, the image looks fine, but at runtime
+# nvmf_create_transport(rdma) returns "Invalid transport type" and every
+# RDMA-labelled node falls back to TCP. Catch that here.
+RUN ldd /usr/local/bin/spdk_tgt | grep -q librdmacm || (echo "FATAL: spdk_tgt not linked against librdmacm (RDMA transport missing)" && exit 1)
+RUN ldd /usr/local/bin/spdk_tgt | grep -q libibverbs || (echo "FATAL: spdk_tgt not linked against libibverbs (RDMA transport missing)" && exit 1)
 
 # Add Tini
 ENV TINI_VERSION v0.19.0

@@ -6,7 +6,7 @@ FROM registry.suse.com/bci/golang:1.26@sha256:2445a685ad302627a2c6b75f0915a37bc1
 ARG TARGETARCH
 ARG http_proxy
 ARG https_proxy
-ARG SRC_BRANCH=master
+ARG SRC_BRANCH=v1.11.x-linkpool
 ARG SRC_TAG
 ARG CACHEBUST
 
@@ -17,7 +17,6 @@ ENV SRC_TAG=${SRC_TAG}
 
 # Install packages
 RUN zypper -n ref && \
-    zypper update -y && \
     zypper -n install cmake wget curl git less file \
     libglib-2_0-0 libkmod-devel libnl3-devel linux-glibc-devel pkg-config \
     psmisc tox qemu-tools fuse python3-devel zlib-devel zlib-devel-static \
@@ -29,7 +28,7 @@ RUN zypper -n ref && \
 # Copy golangci-lint binary from official image
 COPY --from=golangci-lint /usr/bin/golangci-lint /usr/local/bin/golangci-lint
 
-RUN git clone https://github.com/longhorn/dep-versions.git -b ${SRC_BRANCH} /usr/src/dep-versions && \
+RUN git clone https://github.com/linkpoolio/dep-versions.git -b ${SRC_BRANCH} /usr/src/dep-versions && \
     cd /usr/src/dep-versions && \
     if [ -n "${SRC_TAG}" ] && git show-ref --tags ${SRC_TAG} > /dev/null 2>&1; then \
         echo "Checking out tag ${SRC_TAG}"; \
