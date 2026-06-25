@@ -2,23 +2,24 @@ module github.com/longhorn/longhorn-instance-manager
 
 go 1.26.0
 
+toolchain go1.26.3
+
 require (
 	github.com/cockroachdb/errors v1.13.0
 	github.com/google/uuid v1.6.0
 	github.com/longhorn/backupstore v0.0.0-20260525102750-1ed7dde50b68
 	github.com/longhorn/go-common-libs v0.0.0-20260525102658-c0739cd3e2c2
-	github.com/longhorn/go-spdk-helper v0.6.3-0.20260618001233-9facf639a5f8
+	github.com/longhorn/go-spdk-helper v0.6.3-0.20260601101353-0be728aae70e
 	github.com/longhorn/longhorn-engine v1.12.0-dev-20260503.0.20260514055128-ec3f7dbb512f
-	github.com/longhorn/longhorn-spdk-engine v1.13.0-dev-20260614.0.20260618083513-3367e7cd2b7b
+	github.com/longhorn/longhorn-spdk-engine v1.13.0-dev-20260531.0.20260601104844-f87a76cf8bc2
 	github.com/longhorn/types v0.0.0-20260522011813-8f1780fad833
 	github.com/sirupsen/logrus v1.9.4
 	github.com/urfave/cli v1.22.17
-	github.com/urfave/cli/v3 v3.9.0
-	golang.org/x/sync v0.21.0
+	golang.org/x/sync v0.20.0
 	google.golang.org/grpc v1.81.1
 	google.golang.org/protobuf v1.36.12-0.20260120151049-f2248ac996af
 	gopkg.in/check.v1 v1.0.0-20201130134442-10cb98267c6c
-	k8s.io/mount-utils v0.36.2
+	k8s.io/mount-utils v0.36.1
 )
 
 require (
@@ -124,3 +125,9 @@ require (
 	sigs.k8s.io/structured-merge-diff/v6 v6.3.2 // indirect
 	sigs.k8s.io/yaml v1.6.0 // indirect
 )
+
+replace github.com/longhorn/go-spdk-helper => github.com/linkpoolio/go-spdk-helper v0.6.1-0.20260609184748-8002e3abaf32
+
+replace github.com/longhorn/types => github.com/linkpoolio/types v0.0.0-20260610091928-a08cb4ff0b7a
+
+replace github.com/longhorn/longhorn-spdk-engine => github.com/linkpoolio/longhorn-spdk-engine v0.0.0-20260610092230-6ea821a31715
