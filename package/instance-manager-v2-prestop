@@ -76,30 +76,12 @@ spdk_tgt_is_running() {
 function cleanup_spdk_resources() {
     log "Caught termination signal. Cleaning up SPDK resources..."
 
-    # Do not use `pgrep -f spdk_tgt`: the log tee command contains
-    # "/log/spdk_tgt.log" in its argv and can falsely look like a live SPDK
-    # process after spdk_tgt has crashed. Use the PID written by the wrapper,
-    # with an exact argv[0] fallback scan for older pods.
     if ! spdk_tgt_is_running; then
         # spdk_tgt has already exited or crashed. Its NVMe-oF target is gone,
         # so any dm device still mapping a /dev/longhorn volume onto that target
         # has in-flight I/O parked in uninterruptible D-state. That wedged
         # kernel I/O defeats the container's final SIGKILL, so the pod hangs in
-        # Terminating forever -- an un-reapable zombie the instance-manager
-        # controller cannot recreate, which is why a crashed spdk_tgt used to
-        # need a manual `kubectl delete --force`. Any workload still mounted on
-        # those devices stays blocked in D-state too.
-        #
-        # We cannot drain gracefully (the JSON-RPC socket died with spdk_tgt),
-        # and a plain `dmsetup remove` would itself block forever here: it
-        # suspends+flushes, waiting on the very I/O that can never complete.
-        # `dmsetup remove --force` instead swaps in the dm "error" target, which
-        # fails all outstanding and future I/O with EIO immediately -- releasing
-        # the D-state waiters so the device can be torn down, the container
-        # reaped, and the pod recreated with a fresh spdk_tgt. The workload sees
-        # I/O errors (recoverable when the volume reattaches) instead of an
-        # unbounded hang. Bound each call so a single uncooperative device can't
-        # re-hang PreStop.
+        # Terminating forever. Force-fail the dm devices so the pod can be reaped.
         log "spdk_tgt is not running (crashed/exited); force-failing stale dm devices so stuck I/O is released and the pod can be reaped"
         local dead_devices=($(get_v2_devices))
         for device in "${dead_devices[@]}"; do
@@ -113,73 +95,29 @@ function cleanup_spdk_resources() {
         return
     fi
 
-    local v2_devices=($(get_v2_devices))
-    for device in "${v2_devices[@]}"; do
-        # Bound dmsetup remove: a device still holding stuck I/O to a
-        # half-dead target can otherwise block forever and hang PreStop the
-        # same way a fully dead spdk_tgt would.
-        if timeout 10 dmsetup remove "$device"; then
-            log "Removed device-mapper device: $device"
-        else
-            log "Failed to remove device-mapper device (busy or timed out): $device"
-        fi
-
-        device_file="/host/dev/longhorn/$device"
-        if rm "$device_file"; then
-            log "Removed device file: $device_file"
-        else
-            log "Failed to remove device file: $device_file"
-        fi
-    done
-
-    # Drain NVMe-oF listeners BEFORE killing spdk_tgt. Removing each listener
-    # tells SPDK to send a clean RDMA/TCP disconnect frame to every connected
-    # initiator. Without this, peer bdev_nvme controllers see only an
-    # ungraceful transport drop and wedge in "failover already in progress"
-    # for ctrlr_loss_timeout, which on the peer side can starve its reactor
-    # and trip its own liveness probe. Best-effort: per-listener failures
-    # don't block kill-instance.
+    # 1. Drain NVMe-oF listeners BEFORE killing spdk_tgt. Removing each listener
+    #    tells SPDK to send a clean RDMA/TCP disconnect frame to every connected
+    #    initiator. Best-effort: if spdk_tgt is wedged the drain will time out.
     log "Draining NVMe-oF listeners so peer initiators see a clean disconnect..."
-    # Bound the RPC: if spdk_tgt is alive but wedged (unresponsive reactor),
-    # the drain call can hang. A timeout keeps PreStop moving to the kill.
-    if timeout 30 go-spdk-helper nvme-of drain-listeners; then
+    if timeout 15 go-spdk-helper nvme-of drain-listeners; then
         log "Drained NVMe-oF listeners successfully"
     else
         log "Failed to drain NVMe-oF listeners (continuing anyway)"
     fi
-    # Brief settle so the NIC can flush the disconnect frames before the
-    # transport tears down with spdk_tgt's exit.
-    sleep 1
 
+    # 2. Send SIGTERM to spdk_tgt so it flushes its blobstore and exits cleanly.
     log "Sending SIGTERM to go-spdk-helper to stop spdk_tgt..."
-    timeout 30 go-spdk-helper kill-instance --sig-name SIGTERM
+    timeout 10 go-spdk-helper kill-instance --sig-name SIGTERM
     if [[ $? -ne 0 ]]; then
         log "Failed to send SIGTERM to go-spdk-helper"
     else
         log "Successfully sent SIGTERM to go-spdk-helper"
     fi
 
-    # Wait for spdk_tgt to exit after SIGTERM. A healthy shutdown flushes its
-    # blobstore and exits within seconds, so this loop normally breaks almost
-    # immediately and the cap below never bites. The cap matters only for a
-    # *wedged* spdk_tgt -- e.g. one stuck tearing down NVMe-oF controllers that
-    # are themselves stuck in an infinite reconnect loop after a peer storage
-    # node was rebooted. Such a target never exits on its own; waiting out the
-    # old 270s cap left the pod in Terminating for minutes (an apparent zombie)
-    # until kubelet SIGKILLed it at terminationGracePeriodSeconds anyway.
-    #
-    # So: give it a bounded grace for a clean flush, then SIGKILL spdk_tgt
-    # ourselves and force-fail any dm device still mapping its now-dead target,
-    # so the pod is ALWAYS reaped promptly regardless of spdk_tgt's state. A
-    # wedged shutdown would have been SIGKILLed by kubelet at the 300s grace
-    # with the same un-flushed (dirty) blobstore, so killing at the bound here
-    # is never worse for on-disk state -- only faster to reap. The bound is
-    # tunable via SPDK_TGT_SHUTDOWN_GRACE_SEC (default 60s, well under the 300s
-    # pod grace and far above any healthy flush).
-    local grace_sec="${SPDK_TGT_SHUTDOWN_GRACE_SEC:-60}"
+    # 3. Wait for spdk_tgt to exit. A healthy shutdown flushes its blobstore and
+    #    exits within seconds. If wedged, SIGKILL after a bounded grace.
+    local grace_sec="${SPDK_TGT_SHUTDOWN_GRACE_SEC:-30}"
     local deadline=$(( $(date +%s) + grace_sec ))
-    # Use the same exact process check as above. A log tee process must not keep
-    # PreStop waiting after the real spdk_tgt is gone.
     while spdk_tgt_is_running; do
         if [[ $(date +%s) -ge ${deadline} ]]; then
             log "spdk_tgt did not exit within ${grace_sec}s of SIGTERM (wedged shutdown); escalating to SIGKILL so the pod is reaped now"
@@ -189,11 +127,6 @@ function cleanup_spdk_resources() {
                     log "SIGKILLed wedged spdk_tgt pid ${pid}"
                 fi
             done
-            # spdk_tgt's NVMe-oF target is now dead. Any dm device still mapping
-            # a /dev/longhorn volume onto it has in-flight I/O parked in D-state
-            # that would defeat the container's SIGKILL and re-zombie the pod.
-            # Force-fail them (dm "error" target) exactly like the crashed-spdk
-            # branch above, so stuck I/O is released and the pod can be reaped.
             sleep 1
             local device
             local stale_devices=($(get_v2_devices))
@@ -210,6 +143,25 @@ function cleanup_spdk_resources() {
         sleep 1
     done
     log "spdk_tgt exited cleanly after SIGTERM"
+
+    # 4. Now that spdk_tgt is gone, remove dm devices. At this point the block
+    #    devices are no longer held open by spdk_tgt, so dmsetup remove should
+    #    succeed cleanly.
+    local v2_devices=($(get_v2_devices))
+    for device in "${v2_devices[@]}"; do
+        if timeout 10 dmsetup remove "$device"; then
+            log "Removed device-mapper device: $device"
+        else
+            log "Failed to remove device-mapper device (busy or timed out): $device"
+        fi
+
+        device_file="/host/dev/longhorn/$device"
+        if rm -f "$device_file"; then
+            log "Removed device file: $device_file"
+        else
+            log "Failed to remove device file: $device_file"
+        fi
+    done
 }
 
 function get_v2_devices() {

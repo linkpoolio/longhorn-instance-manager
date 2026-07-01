@@ -266,6 +266,13 @@ func start(c *cli.Context) (err error) {
 		sig := <-sigs
 		logrus.Infof("Instance Manager received %v to exit", sig)
 
+		// Cancel the context first so that SPDK server background
+		// goroutines (engine frontend reconciler, replica reconciler,
+		// monitoring loop, broadcasting) stop before we tear down
+		// gRPC servers. This prevents the reconciler from triggering
+		// new EngineFrontendCreate/Delete operations during shutdown.
+		cancel()
+
 		for _, server := range servers {
 			server.Stop()
 		}
