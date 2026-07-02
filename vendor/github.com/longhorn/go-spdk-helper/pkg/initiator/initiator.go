@@ -967,6 +967,20 @@ func (i *Initiator) ensureNVMeTCPPathWithoutLock(transportAddress, transportServ
 		return err
 	}
 
+	// A connect must not leave its own corpses behind: when the engine
+	// target moved (new port after an IM restart), the dead controller for
+	// the old target stays in "connecting" forever — SPDK port reuse keeps
+	// re-arming the kernel reconnect loop before ctrl-loss-tmo can expire it,
+	// and every such session taxes all host NVMe operations on the node.
+	// Clear this subsystem's dead siblings now that the new path is up.
+	// Ordering matters: a delete_controller write can sleep uninterruptibly
+	// while namespace I/O is queued with no usable path, so this must run
+	// AFTER the new path exists (the live path drains that I/O, letting the
+	// delete complete); the per-controller disconnect timeout bounds the
+	// residual worst case. Live paths — real multipath siblings — and the
+	// just-connected target are never touched.
+	i.disconnectDeadSiblingControllers(transportAddress, transportServiceID)
+
 	return nil
 }
 
@@ -1061,6 +1075,44 @@ func (i *Initiator) discoverAndConnectNVMeTCPTarget(transportAddress, transportS
 	}
 
 	return subsystemNQN, controllerName, nil
+}
+
+// deadSiblingControllerPaths returns the subsystem's paths that neither match
+// the freshly-connected good path nor are live: dead siblings a completed
+// connect must clear so a replaced target does not leave an immortal
+// reconnect loop behind. Pure (no I/O) so the selection is unit testable.
+func deadSiblingControllerPaths(subsystems []Subsystem, nqn, goodIP, goodPort string) []Path {
+	var dead []Path
+	for _, path := range staleControllerPaths(subsystems, nqn, goodIP, goodPort) {
+		if strings.EqualFold(path.State, "live") {
+			continue
+		}
+		dead = append(dead, path)
+	}
+	return dead
+}
+
+// disconnectDeadSiblingControllers disconnects this subsystem's dead sibling
+// controllers after a successful connect to (goodIP, goodPort). Best-effort
+// and bounded: each disconnect is capped by staleControllerDisconnectTimeout,
+// and failures are logged, never returned — the connect has already
+// succeeded.
+func (i *Initiator) disconnectDeadSiblingControllers(goodIP, goodPort string) {
+	if i.NVMeTCPInfo == nil || i.NVMeTCPInfo.SubsystemNQN == "" {
+		return
+	}
+	subsystems, err := GetSubsystems(i.executor)
+	if err != nil {
+		i.logger.WithError(err).Warn("Failed to list subsystems while clearing dead sibling controllers after connect")
+		return
+	}
+	for _, path := range deadSiblingControllerPaths(subsystems, i.NVMeTCPInfo.SubsystemNQN, goodIP, goodPort) {
+		i.logger.Warnf("Disconnecting dead NVMe/TCP sibling %s (%s, state=%s) for %s after connecting %s:%s",
+			path.Name, path.Address, path.State, i.NVMeTCPInfo.SubsystemNQN, goodIP, goodPort)
+		if err := disconnectControllerWithTimeout(path.Name, staleControllerDisconnectTimeout, i.executor); err != nil {
+			i.logger.WithError(err).Warnf("Failed to disconnect dead NVMe/TCP sibling %s within %s", path.Name, staleControllerDisconnectTimeout)
+		}
+	}
 }
 
 // findControllerBySubsystem looks up the controller name for the given NQN
