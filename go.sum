@@ -150,8 +150,8 @@ github.com/linkpoolio/go-common-libs v0.0.0-20260623134507-fea5f2490080 h1:LOwjt
 github.com/linkpoolio/go-common-libs v0.0.0-20260623134507-fea5f2490080/go.mod h1:+aXFI8DmHTX4Az9pZF16/XKfrVKWIESJjw+hcxdMslw=
 github.com/linkpoolio/go-spdk-helper v0.6.1-0.20260702171959-990204bb6efb h1:DqTSRQZtdE3uPSSKx5slstSw+zcEE2drnSSxbBbdtMQ=
 github.com/linkpoolio/go-spdk-helper v0.6.1-0.20260702171959-990204bb6efb/go.mod h1:8h1sMu2SCv0iBuLlSSVnOwmQoje1LMSkJ40sKwSb1/U=
-github.com/linkpoolio/longhorn-spdk-engine v1.11.1-linkpool.115.0.20260702172051-047f20c97aaa h1:UEZprOa4ZTHqLA79LNRP6RfoAiTceLHDfDlUVQCIQvM=
-github.com/linkpoolio/longhorn-spdk-engine v1.11.1-linkpool.115.0.20260702172051-047f20c97aaa/go.mod h1:EGxIUdHiSAI/jjIME973lCqn5NCYRmi1AEl43Yvhhik=
+github.com/linkpoolio/longhorn-spdk-engine v1.11.1-linkpool.115.0.20260704090837-09054a1643d4 h1:bEYqT4fLdmHsazw3/4aO6sidOp9+qK+d5cpAFqwVC7U=
+github.com/linkpoolio/longhorn-spdk-engine v1.11.1-linkpool.115.0.20260704090837-09054a1643d4/go.mod h1:EGxIUdHiSAI/jjIME973lCqn5NCYRmi1AEl43Yvhhik=
 github.com/linkpoolio/types v0.0.0-20260610091928-a08cb4ff0b7a h1:/9vz16MpHRBdu2InR4sl9QBtCEZH2T69zSsE5OGvCqc=
 github.com/linkpoolio/types v0.0.0-20260610091928-a08cb4ff0b7a/go.mod h1:F84Y4B+3GyEcjr9EbwdI3RgOzT8nm2EqHxqyTWkCfRE=
 github.com/longhorn/backupstore v0.0.0-20260525102750-1ed7dde50b68 h1:p05ShG/5GrcHLU0+ZejEogNONg99e6JS1hq9qXY0B8o=
