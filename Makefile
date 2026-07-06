@@ -5,7 +5,7 @@ MACHINE := longhorn
 # defined in TARGET_PLATFORMS, and must be a subset of the below:
 DEFAULT_PLATFORMS := linux/amd64,linux/arm64
 
-export SRC_BRANCH := v1.11.x-linkpool
+export SRC_BRANCH := reset/main
 export SRC_TAG := $(shell git tag --points-at HEAD | head -n 1)
 
 export CACHEBUST := $(shell date +%s)
