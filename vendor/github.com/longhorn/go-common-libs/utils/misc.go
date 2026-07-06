@@ -1,7 +1,6 @@
 package utils
 
 import (
-	"cmp"
 	"crypto/rand"
 	"fmt"
 	"math/big"
@@ -14,6 +13,7 @@ import (
 
 	"github.com/cockroachdb/errors"
 	"github.com/google/uuid"
+	"golang.org/x/exp/constraints"
 
 	"k8s.io/apimachinery/pkg/util/version"
 
@@ -125,7 +125,7 @@ func ConvertTypeToString[T any](value T) string {
 }
 
 // SortKeys sorts the keys of a map in ascending order.
-func SortKeys[K cmp.Ordered, V any](mapObj map[K]V) ([]K, error) {
+func SortKeys[K constraints.Ordered, V any](mapObj map[K]V) ([]K, error) {
 	if mapObj == nil {
 		return nil, fmt.Errorf("input object cannot be nil")
 	}
