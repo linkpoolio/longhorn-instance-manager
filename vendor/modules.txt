@@ -383,7 +383,7 @@ github.com/longhorn/longhorn-engine/pkg/sync
 github.com/longhorn/longhorn-engine/pkg/types
 github.com/longhorn/longhorn-engine/pkg/util
 github.com/longhorn/longhorn-engine/pkg/util/disk
-# github.com/longhorn/longhorn-spdk-engine v1.13.0-dev-20260614.0.20260618083513-3367e7cd2b7b => github.com/linkpoolio/longhorn-spdk-engine v0.0.0-20260706140531-3418c839fe15
+# github.com/longhorn/longhorn-spdk-engine v1.13.0-dev-20260614.0.20260618083513-3367e7cd2b7b => github.com/linkpoolio/longhorn-spdk-engine v0.0.0-20260706150723-059eaa4bfa82
 ## explicit; go 1.26.0
 github.com/longhorn/longhorn-spdk-engine/pkg/api
 github.com/longhorn/longhorn-spdk-engine/pkg/client
@@ -970,5 +970,5 @@ sigs.k8s.io/structured-merge-diff/v6/value
 sigs.k8s.io/yaml
 # github.com/longhorn/types => github.com/linkpoolio/types v0.0.0-20260610135513-3130d10db443
 # github.com/longhorn/go-spdk-helper => github.com/linkpoolio/go-spdk-helper v0.6.1-0.20260706135231-2457f6714c55
-# github.com/longhorn/longhorn-spdk-engine => github.com/linkpoolio/longhorn-spdk-engine v0.0.0-20260706140531-3418c839fe15
+# github.com/longhorn/longhorn-spdk-engine => github.com/linkpoolio/longhorn-spdk-engine v0.0.0-20260706150723-059eaa4bfa82
 # github.com/longhorn/go-common-libs => github.com/linkpoolio/go-common-libs v0.0.0-20260623134507-fea5f2490080
