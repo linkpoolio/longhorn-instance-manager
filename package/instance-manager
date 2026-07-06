@@ -140,6 +140,9 @@ while [[ $# -gt 0 ]]; do
             ;;
         -s|--spdk-memory-size)
             spdk_options+=("--mem-size" "$2")
+            # The engine derives its iobuf pool sizes and validates them
+            # against this hugepage budget.
+            export LONGHORN_V2_SPDK_MEM_SIZE_MIB="$2"
             shift
             ;;
         --spdk-iobuf-large-pool-size)
