@@ -13,7 +13,10 @@ import (
 	"testing"
 	"time"
 
+	spdkapi "github.com/longhorn/longhorn-spdk-engine/pkg/api"
 	rpc "github.com/longhorn/types/pkg/generated/imrpc"
+
+	"github.com/longhorn/longhorn-instance-manager/pkg/types"
 )
 
 func buildTestTLSConfig(t *testing.T) *tls.Config {
@@ -172,5 +175,116 @@ func TestNewServer_WithoutTLS(t *testing.T) {
 
 	if v2Ops.spdkTLSConfig != nil {
 		t.Error("V2 ops spdkTLSConfig should be nil when TLS is not provided")
+	}
+}
+
+// instanceStateRunning is the SPDK-reported state string for a running
+// instance (spdk-engine types.InstanceStateRunning); the conversion helpers
+// pass it through verbatim and the manager compares against the equivalent
+// longhorn.InstanceStateRunning to drive the Running transition.
+const instanceStateRunning = "running"
+
+// The manager's instance-manager monitor classifies every instance returned by
+// InstanceList by its Spec.Type into the per-type maps on
+// InstanceManager.Status (InstanceEngines / InstanceEngineFrontends /
+// InstanceReplicas). The reconcile loop then only observes an instance as
+// Running once it appears in the map for its type. So each conversion helper
+// MUST stamp the correct InstanceType, pass through the SPDK-reported state,
+// and surface the transport-specific fields (per-path transport, replica
+// tcp/rdma ports) the manager publishes on the CRDs.
+func TestEngineFrontendResponseToInstanceResponse(t *testing.T) {
+	ef := &spdkapi.EngineFrontend{
+		Name:       "pvc-test-ef-0",
+		EngineName: "pvc-test-e-0",
+		Endpoint:   "/dev/longhorn/pvc-test",
+		Frontend:   "spdk-tcp-blockdev",
+		State:      instanceStateRunning,
+		Paths: []*spdkapi.EngineFrontendNvmeTCPPath{
+			{TargetIP: "10.0.0.1", TargetPort: 20001, NQN: "nqn.test", ANAState: "optimized", Transport: "rdma"},
+		},
+	}
+
+	got := engineFrontendResponseToInstanceResponse(ef)
+
+	if got.Spec.Type != types.InstanceTypeEngineFrontend {
+		t.Errorf("type: got %q, want %q", got.Spec.Type, types.InstanceTypeEngineFrontend)
+	}
+	if got.Spec.Name != ef.Name {
+		t.Errorf("name: got %q, want %q", got.Spec.Name, ef.Name)
+	}
+	if got.Status.State != ef.State {
+		t.Errorf("state: got %q, want %q (manager keys the Running transition on this)", got.Status.State, ef.State)
+	}
+	if got.Status.EngineName != ef.EngineName {
+		t.Errorf("engineName: got %q, want %q", got.Status.EngineName, ef.EngineName)
+	}
+	if got.Status.Endpoint != ef.Endpoint {
+		t.Errorf("endpoint: got %q, want %q", got.Status.Endpoint, ef.Endpoint)
+	}
+	if len(got.Status.Paths) != 1 {
+		t.Fatalf("paths: got %d, want 1", len(got.Status.Paths))
+	}
+	if got.Status.Paths[0].Transport != "rdma" {
+		t.Errorf("path transport: got %q, want %q (manager publishes this on the EngineFrontend CRD)", got.Status.Paths[0].Transport, "rdma")
+	}
+	if got.Status.Paths[0].AnaState != "optimized" {
+		t.Errorf("path anaState: got %q, want %q", got.Status.Paths[0].AnaState, "optimized")
+	}
+}
+
+func TestReplicaResponseToInstanceResponseTransportPorts(t *testing.T) {
+	got := replicaResponseToInstanceResponse(&spdkapi.Replica{
+		Name:      "pvc-test-r-0",
+		State:     instanceStateRunning,
+		PortStart: 20001,
+		PortEnd:   20016,
+		TcpPort:   20001,
+		RdmaPort:  20002,
+	})
+	if got.Spec.Type != types.InstanceTypeReplica {
+		t.Errorf("type: got %q, want %q", got.Spec.Type, types.InstanceTypeReplica)
+	}
+	if got.Status.State != instanceStateRunning {
+		t.Errorf("state: got %q, want %q", got.Status.State, instanceStateRunning)
+	}
+	if got.Status.TcpPort != 20001 {
+		t.Errorf("tcpPort: got %d, want %d", got.Status.TcpPort, 20001)
+	}
+	if got.Status.RdmaPort != 20002 {
+		t.Errorf("rdmaPort: got %d, want %d", got.Status.RdmaPort, 20002)
+	}
+}
+
+// imrpcTransportMapToSPDKRPC bridges two structurally identical generated
+// messages. These tests pin the empty-map passthrough (the engine must see
+// nil so it falls back to ReplicaAddressMap) and the per-entry mapping.
+func TestImrpcTransportMapToSPDKRPCEmpty(t *testing.T) {
+	if got := imrpcTransportMapToSPDKRPC(nil); got != nil {
+		t.Errorf("nil input: got %v, want nil", got)
+	}
+	if got := imrpcTransportMapToSPDKRPC(map[string]*rpc.ReplicaTransportAddresses{}); got != nil {
+		t.Errorf("empty input: got %v, want nil (engine falls back to ReplicaAddressMap)", got)
+	}
+}
+
+func TestImrpcTransportMapToSPDKRPCFields(t *testing.T) {
+	in := map[string]*rpc.ReplicaTransportAddresses{
+		"pvc-test-r-0": {TcpAddress: "10.0.0.1:20001", RdmaAddress: "10.1.0.1:20002"},
+		"pvc-test-r-1": nil, // nil entries are skipped, not copied
+	}
+
+	got := imrpcTransportMapToSPDKRPC(in)
+	if len(got) != 1 {
+		t.Fatalf("entries: got %d, want 1 (nil entries must be dropped)", len(got))
+	}
+	addrs := got["pvc-test-r-0"]
+	if addrs == nil {
+		t.Fatal("pvc-test-r-0: missing entry")
+	}
+	if addrs.TcpAddress != "10.0.0.1:20001" {
+		t.Errorf("tcpAddress: got %q, want %q", addrs.TcpAddress, "10.0.0.1:20001")
+	}
+	if addrs.RdmaAddress != "10.1.0.1:20002" {
+		t.Errorf("rdmaAddress: got %q, want %q", addrs.RdmaAddress, "10.1.0.1:20002")
 	}
 }
